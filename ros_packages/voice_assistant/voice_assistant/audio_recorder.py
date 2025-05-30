@@ -181,9 +181,9 @@ class AudioRecorderNode(Node):
 
         # TODO: public-api should accept raw pcm data in future -> this step will be unnecessary
         with wave.open(OUTPUT_FILE_PATH, "wb") as wave_file:
-            wave_file.setnchannels(1)
-            wave_file.setsampwidth(2)
-            wave_file.setframerate(16000)
+            wave_file.setnchannels(NUM_CHANNELS)
+            wave_file.setsampwidth(BYTES_PER_SAMPLE)
+            wave_file.setframerate(FRAMES_PER_SECOND)
             wave_file.writeframes(data)
             self.get_logger().info("saved audio file {OUTPUT_FILE_PATH}")
             wave_file.close()
