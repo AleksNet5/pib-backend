@@ -29,7 +29,7 @@ FRAMES_PER_CHUNK = 1024
 
 # TODO: his value should not be hardcoded, as the optimal value
 # depends on the level of background noise.
-SILENCE_VOLUME_THRESHOLD = 500
+SILENCE_VOLUME_THRESHOLD = 700
 
 VOICE_ASSISTANT_DIRECTORY = os.getenv(
     "VOICE_ASSISTANT_DIR", "/home/pib/ros_working_dir/src/voice_assistant"
