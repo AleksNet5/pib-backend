@@ -15,7 +15,7 @@ class Ros2AudioRecorder(Node):
                  sample_rate: int = 16000,
                  channels: int = 1,
                  clip_duration: float = 4.0):
-        super().__init__('ros2_audio_recorder')
+        super().__init__('test_audio')
 
         # Recording parameters
         self.sample_rate = sample_rate
