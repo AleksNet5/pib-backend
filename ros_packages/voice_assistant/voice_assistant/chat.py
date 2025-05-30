@@ -302,11 +302,12 @@ class ChatNode(Node):
 
         # return the rest of the received text, that has not been forwarded as feedback
         goal_handle.succeed()
-
+        self.get_logger().info("Succeed!")
         # return the result
         result = Chat.Result()
         if prev_text is None:
             result.text = curr_text
+            self.get_logger().info(" result.text!")
             result.text_type = Chat.Goal.TEXT_TYPE_SENTENCE
         else:
             result.text = prev_text
