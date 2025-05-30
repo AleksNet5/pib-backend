@@ -21,15 +21,14 @@ from . import util
 # these values define the pcm-encoding, in which the recorded
 # audio will be received
 BYTES_PER_SAMPLE = 2
-FRAMES_PER_SECOND = 48000
-NUM_CHANNELS = 2
+FRAMES_PER_SECOND = 16000
+NUM_CHANNELS = 1
 CHUNKS_PER_SECOND = 10
 
 FRAMES_PER_CHUNK = 1024
-
 # TODO: his value should not be hardcoded, as the optimal value
 # depends on the level of background noise.
-SILENCE_VOLUME_THRESHOLD = 700
+SILENCE_VOLUME_THRESHOLD = 500
 
 VOICE_ASSISTANT_DIRECTORY = os.getenv(
     "VOICE_ASSISTANT_DIR", "/home/pib/ros_working_dir/src/voice_assistant"
@@ -185,10 +184,8 @@ class AudioRecorderNode(Node):
             wave_file.setsampwidth(BYTES_PER_SAMPLE)
             wave_file.setframerate(FRAMES_PER_SECOND)
             wave_file.writeframes(data)
-            self.get_logger().info("saved audio file {OUTPUT_FILE_PATH}")
             wave_file.close()
 
-        self.get_logger().info(OUTPUT_FILE_PATH)
         with open(OUTPUT_FILE_PATH, "rb") as f:
             data = f.read()
 
