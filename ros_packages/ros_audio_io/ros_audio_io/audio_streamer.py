@@ -16,7 +16,7 @@ class AudioStreamer(Node):
         self.chunk = 1024  # Buffer size
         self.format = pyaudio.paInt16  # 16-bit audio format
         self.channels = 1  # Mono recording
-        self.rate = 16000  # Sample rate in Hz
+        self.rate = 48000  # Sample rate in Hz
         self.input_device_index = None  # Will be determined dynamically
 
         # ROS2 publisher for raw audio chunks
