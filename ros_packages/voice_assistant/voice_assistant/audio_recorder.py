@@ -22,14 +22,14 @@ from . import util
 # audio will be received
 BYTES_PER_SAMPLE = 2
 FRAMES_PER_SECOND = 48000
-NUM_CHANNELS = 1
+NUM_CHANNELS = 2
 CHUNKS_PER_SECOND = 10
 
 FRAMES_PER_CHUNK = 1024
 
 # TODO: his value should not be hardcoded, as the optimal value
 # depends on the level of background noise.
-SILENCE_VOLUME_THRESHOLD = 1000
+SILENCE_VOLUME_THRESHOLD = 500
 
 VOICE_ASSISTANT_DIRECTORY = os.getenv(
     "VOICE_ASSISTANT_DIR", "/home/pib/ros_working_dir/src/voice_assistant"

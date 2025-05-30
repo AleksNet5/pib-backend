@@ -15,7 +15,7 @@ class AudioStreamer(Node):
         # Audio parameters
         self.chunk = 1024  # Buffer size
         self.format = pyaudio.paInt16  # 16-bit audio format
-        self.channels = 1  # Mono recording
+        self.channels = 2  # Mono recording
         self.rate = 48000  # Sample rate in Hz
         self.input_device_index = None  # Will be determined dynamically
 
