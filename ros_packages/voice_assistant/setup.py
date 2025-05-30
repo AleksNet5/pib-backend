@@ -26,6 +26,7 @@ setup(
             "assistant = voice_assistant.assistant:main",
             "chat = voice_assistant.chat:main",
             "audio_recorder = voice_assistant.audio_recorder:main",
+            "audio_recorder = voice_assistant.test_audio:main",
             "audio_player = voice_assistant.audio_player:main",
             "token_service = voice_assistant.token_service:main",
         ],

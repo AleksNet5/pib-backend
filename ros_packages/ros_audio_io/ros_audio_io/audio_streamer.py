@@ -34,7 +34,7 @@ class AudioStreamer(Node):
         self.timer = self.create_timer(self.chunk / self.rate, self.publish_audio)
 
     def select_input_device(self):
-        """Select the user-preferred audio device or fall back to default."""
+        """Select the user-preferred audio device or fall back to default, and log its sample rate."""
         found = None
         for i in range(self.audio.get_device_count()):
             info = self.audio.get_device_info_by_index(i)
@@ -56,6 +56,7 @@ class AudioStreamer(Node):
             try:
                 default = self.audio.get_default_input_device_info()
                 self.input_device_index = int(default['index'])
+                info = default
                 self.get_logger().warn(
                     f"No device matching '{self.preferred}'; falling back to default: "
                     f"{default['name']} (index {self.input_device_index})"
@@ -65,6 +66,17 @@ class AudioStreamer(Node):
                     f"No device matching '{self.preferred}' and no default input; shutting down."
                 )
                 self.input_device_index = None
+                return
+
+        # Log the device's native sample rate (frames per second)
+        sample_rate = info.get('defaultSampleRate')
+        if sample_rate:
+            self.get_logger().info(f"Device sample rate: {int(sample_rate)} Hz")
+            # Optionally store it for use elsewhere:
+            self.rate = int(sample_rate)
+        else:
+            self.get_logger().warn("Could not determine device sample rate; using fallback rate.")
+
 
     def publish_audio(self):
         """Read audio data from the microphone and publish it."""
