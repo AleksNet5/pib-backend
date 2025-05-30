@@ -70,6 +70,7 @@ class AudioRecorderNode(Node):
             10
         )
         self.get_logger().info("Now running AUDIO RECORDER")
+        self.get_logger().info(OUTPUT_FILE_PATH)
 
     def get_public_api_token_listener(self, msg):
         token = msg.data
@@ -185,7 +186,6 @@ class AudioRecorderNode(Node):
             wave_file.setsampwidth(BYTES_PER_SAMPLE)
             wave_file.setframerate(FRAMES_PER_SECOND)
             wave_file.writeframes(data)
-            self.get_logger().info(wave_file.__sizeof__()) 
             wave_file.close()
 
         self.get_logger().info(OUTPUT_FILE_PATH)
