@@ -185,8 +185,10 @@ class AudioRecorderNode(Node):
             wave_file.setsampwidth(BYTES_PER_SAMPLE)
             wave_file.setframerate(FRAMES_PER_SECOND)
             wave_file.writeframes(data)
+            self.get_logger(wave_file.__sizeof__()) 
             wave_file.close()
-
+            
+        self.get_logger(OUTPUT_FILE_PATH)
         with open(OUTPUT_FILE_PATH, "rb") as f:
             data = f.read()
 
