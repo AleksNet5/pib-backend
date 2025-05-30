@@ -89,6 +89,7 @@ class AudioRecorderNode(Node):
         with self.audio_chunks_lock:
             self.audio_chunks.append(chunk_bytes)
             self.audio_chunk_event.set()
+            self.get_logger().info("Recived audio chunk")
     
     def get_next_chunk(self) -> bytes:
     # wait until a chunk is available

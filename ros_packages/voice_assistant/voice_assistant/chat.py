@@ -194,6 +194,7 @@ class ChatNode(Node):
                     model=personality.assistant_model.api_name,
                     public_api_token=self.token,
                 )
+            self.get_logger().info("recievd assistance-respond")
 
             # regex for indentifying sentences
             sentence_pattern = re.compile(
@@ -214,6 +215,7 @@ class ChatNode(Node):
             bool_update_chat_message: bool = False
 
             for token in tokens:
+                self.get_logger().info("token {token}")
 
                 if prev_text is not None:
                     # publish the previously collected text in form of feedback
@@ -223,11 +225,12 @@ class ChatNode(Node):
                     goal_handle.publish_feedback(feedback)
                     prev_text = None
                     prev_text_type = None
-
+                self.get_logger().info("adding tokken to current text")
                 # add token to current text; remove leading white-spaces, if current-text is empty
                 curr_text = curr_text + (
                     token if len(curr_text) > 0 else token.lstrip()
                 )
+                self.get_logger().info("stripping text")
 
                 while (
                     True
