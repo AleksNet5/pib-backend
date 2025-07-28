@@ -25,6 +25,7 @@ setup(
         "console_scripts": [
             "assistant = voice_assistant.assistant:main",
             "chat = voice_assistant.chat:main",
+            "gemini_chat = voice_assistant.gemini_chat_node:main",
             "audio_recorder = voice_assistant.audio_recorder:main",
             "audio_player = voice_assistant.audio_player:main",
             "token_service = voice_assistant.token_service:main",
