@@ -19,7 +19,6 @@ from rclpy.publisher import Publisher
 from std_msgs.msg import String
 
 from public_api_client import public_voice_client
-from .chat_factory import chat_completion as factory_chat_completion
 
 # in future, this code will be prepended to the description in a chat-request
 # if it is specified that code should be generated. The text will contain
@@ -191,16 +190,15 @@ class ChatNode(Node):
             image_base64 = response.image_base64
 
         try:
-            # receive assistant-response in form of an async iterable of tokens
+            # receive assistant-response in form of a token generator
             with self.public_voice_client_lock:
-                tokens = factory_chat_completion(
+                tokens = public_voice_client.chat_completion(
                     text=content,
                     description=description,
                     message_history=message_history,
                     image_base64=image_base64,
                     model=personality.assistant_model.api_name,
                     public_api_token=self.token,
-                    chat_id=chat_id,
                 )
 
             # regex for indentifying sentences
@@ -221,7 +219,7 @@ class ChatNode(Node):
             # for tracking if a message is an update or a new message
             bool_update_chat_message: bool = False
 
-            async for token in tokens:
+            for token in tokens:
                 if token is None:
                     self.get_logger().info(f"Got pers")
 
