@@ -8,7 +8,6 @@ from datatypes.action import Chat
 from datatypes.msg import ChatMessage
 from datatypes.srv import GetCameraImage
 from pib_api_client import voice_assistant_client
-from public_api_client.public_voice_client import PublicApiChatMessage
 from rclpy.action import ActionServer
 from rclpy.action import CancelResponse
 from rclpy.action.server import ServerGoalHandle
@@ -18,7 +17,6 @@ from rclpy.node import Node
 from rclpy.publisher import Publisher
 from std_msgs.msg import String
 
-from public_api_client import public_voice_client
 from .chat_factory import chat_completion as factory_chat_completion
 
 # in future, this code will be prepended to the description in a chat-request
@@ -62,8 +60,6 @@ class ChatNode(Node):
             String, "public_api_token", self.get_public_api_token_listener, 10
         )
 
-        # lock that should be aquired, whenever accessing 'public_voice_client'
-        self.public_voice_client_lock = Lock()
         # lock that should be aquired, whenever accessing 'voice_assistant_client'
         self.voice_assistant_client_lock = Lock()
 
@@ -192,7 +188,6 @@ class ChatNode(Node):
 
         try:
             # receive assistant-response in form of an async iterable of tokens
-            with self.public_voice_client_lock:
                 tokens = factory_chat_completion(
                     text=content,
                     description=description,
