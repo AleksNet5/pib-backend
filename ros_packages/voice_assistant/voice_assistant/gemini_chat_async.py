@@ -1,34 +1,33 @@
-# voice_assistant/gemini_chat_async.py
 from __future__ import annotations
 import os
 import asyncio
 from typing import AsyncIterable, Iterable, List, Optional
 
-import google.genai as genai
-from google.genai import types
+import google.generativeai as genai
+from google.generativeai.types import ChatMessage, ChatRole, Blob
 from public_api_client.public_voice_client import PublicApiChatMessage
 
 GOOGLE_API_KEY_ENV = "GOOGLE_API_KEY"
 
-def _configure_api_key() -> None:
-    key = "AIzaSyDCcTrpz2KoNOf4Y3bGPGiuLupnthweVYA"
-    if not key:
-        raise RuntimeError(f"{GOOGLE_API_KEY_ENV} not set")
-    genai.configure(api_key=key)
 
-def _build_history(
-    messages: List[PublicApiChatMessage],
-) -> list[types.ChatMessage]:
+def _configure_api_key() -> None:
+    api_key = os.getenv(GOOGLE_API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError(f"{GOOGLE_API_KEY_ENV} not set")
+    genai.configure(api_key=api_key)
+
+
+def _build_history(messages: List[PublicApiChatMessage]) -> List[ChatMessage]:
     return [
-        types.ChatMessage(
-            role=types.ChatRole.USER if m.is_user else types.ChatRole.ASSISTANT,
+        ChatMessage(
+            role=ChatRole.USER if m.is_user else ChatRole.MODEL,
             content=m.content
         )
         for m in messages
     ]
 
+
 class GeminiLiveSession:
-    """Persistent Gemini Live API session with interrupt support."""
     def __init__(
         self,
         *,
@@ -39,26 +38,27 @@ class GeminiLiveSession:
         self.description = description
         self.history = message_history
         self.model = model
-        self._session_cm: Optional[types.LiveConnect] = None
-        self._session: Optional[types.LiveSession] = None
+        self._session_cm = None
+        self._session = None
         self._lock = asyncio.Lock()
 
     async def _ensure_session(self) -> None:
         if self._session is not None:
             return
+
         _configure_api_key()
+
         self._session_cm = genai.Client().aio.live.connect(
             model=self.model,
             config={
                 "system_instruction": self.description,
-                "response_modalities": ["AUDIO", "TEXT"]
-            },
+                "response_modalities": ["TEXT", "AUDIO"]
+            }
         )
         self._session = await self._session_cm.__aenter__()
-        # send system prompt + history
-        await self._session.send(
-            types.ChatMessage(role=types.ChatRole.SYSTEM, content=self.description)
-        )
+
+        # Send system instruction and chat history
+        await self._session.send(ChatMessage(role=ChatRole.SYSTEM, content=self.description))
         for msg in _build_history(self.history):
             await self._session.send(msg)
 
@@ -68,42 +68,33 @@ class GeminiLiveSession:
         *,
         audio_stream: Optional[Iterable[bytes]] = None
     ) -> AsyncIterable[str]:
-        """
-        Send a new user turn (text and/or audio) and yield back text tokens live.
-        Stops yielding if the model is interrupted by new input.
-        """
-        # ensure only one turn at a time
         async with self._lock:
             await self._ensure_session()
 
-            # send text if provided
-            if text is not None:
-                await self._session.send(
-                    types.ChatMessage(role=types.ChatRole.USER, content=text)
-                )
+            if text:
+                await self._session.send(ChatMessage(role=ChatRole.USER, content=text))
+                if not audio_stream:
+                    await self._session.end_turn()
 
-            # stream audio if provided
-            if audio_stream is not None:
+            if audio_stream:
                 for chunk in audio_stream:
                     await self._session.send_realtime_input(
-                        audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+                        audio=Blob(data=chunk, mime_type="audio/pcm;rate=16000")
                     )
                 await self._session.send_realtime_input(audio_stream_end=True)
 
-            # stream back the response until complete or interrupted
             async for event in self._session.receive():
                 if getattr(event, "interrupted", False):
-                    # model was cut off by user—end this turn
                     break
                 if event.text:
                     yield event.text
 
     async def close(self) -> None:
-        """Terminate the WebSocket and clear session state."""
-        if self._session_cm is not None:
+        if self._session_cm:
             await self._session_cm.__aexit__(None, None, None)
-            self._session_cm = None
-            self._session = None
+        self._session_cm = None
+        self._session = None
+
 
 async def gemini_chat_completion(
     *,
@@ -112,15 +103,9 @@ async def gemini_chat_completion(
     message_history: List[PublicApiChatMessage],
     image_base64: Optional[str],
     model: str,
-    public_api_token: str,     # still required by PIB but we read key from env
+    public_api_token: str,
     audio_stream: Optional[Iterable[bytes]] = None,
 ) -> AsyncIterable[str]:
-    """
-    Live, interruptible Gemini chat. Reuses one session per call.
-    If you call this again on the same session, history/context is preserved.
-    """
-    # We'll create a new session for each call here; for multi-turn you can
-    # hoist session creation out and reuse the same GeminiLiveSession.
     session = GeminiLiveSession(
         description=description,
         message_history=message_history,

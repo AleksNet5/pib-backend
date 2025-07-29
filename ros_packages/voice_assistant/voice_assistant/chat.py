@@ -188,7 +188,7 @@ class ChatNode(Node):
 
         try:
             # receive assistant-response in form of an async iterable of tokens
-                tokens = factory_chat_completion(
+            tokens = factory_chat_completion(
                     text=content,
                     description=description,
                     message_history=message_history,
@@ -196,7 +196,7 @@ class ChatNode(Node):
                     model=personality.assistant_model.api_name,
                     public_api_token=self.token,
                     chat_id=chat_id,
-                )
+            )
 
             # regex for indentifying sentences
             sentence_pattern = re.compile(
