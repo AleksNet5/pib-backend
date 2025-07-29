@@ -3,8 +3,8 @@ import os
 import asyncio
 from typing import AsyncIterable, Iterable, List, Optional
 
-import google.generativeai as genai
-from google.generativeai.types import ChatMessage, ChatRole, Blob
+import google as genai
+from google import ChatMessage, ChatRole, Blob
 from public_api_client.public_voice_client import PublicApiChatMessage
 
 GOOGLE_API_KEY_ENV = "GOOGLE_API_KEY"
