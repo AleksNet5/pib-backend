@@ -24,15 +24,19 @@ from rclpy.publisher import Publisher
 from rclpy.service import Service
 from rclpy.task import Future
 from voice_assistant import START_SIGNAL_FILE, STOP_SIGNAL_FILE
-
 MAX_SILENT_SECONDS_BEFORE = 8.0
 
+from voice_assistant.audio_loop import GeminiAudioLoop
+import threading
+import asyncio
 
 class VoiceAssistantNode(Node):
 
     def __init__(self):
 
         super().__init__("voice_assistant")
+
+        self.gemini_loop = GeminiAudioLoop(api_key="YOUR_API_KEY")
 
         # state -------------------------------------------------------------------------
 
@@ -272,7 +276,7 @@ class VoiceAssistantNode(Node):
         self, request: GetChatIsListening.Request, response: GetChatIsListening.Response
     ) -> GetChatIsListening.Response:
         """callback function for 'get_chat_is_listening' service"""
-        response.listening = self.get_is_listening(request.chat_id)
+        response.listening = self.get_is_listening(request.chat_id) or self.gemini_loop.is_listening
         return response
 
     def send_chat_message(
@@ -280,6 +284,11 @@ class VoiceAssistantNode(Node):
     ) -> SendChatMessage.Response:
         """callback function for 'send_chat_message' service"""
 
+        if (
+            self.gemini_loop.is_listening
+        ):
+            return response
+        
         # do not create a message, if chat is not listening
         if not self.get_is_listening(request.chat_id):
             return response
@@ -316,18 +325,38 @@ class VoiceAssistantNode(Node):
     # callback cycle --------------------------------------------------------------------
 
     def on_start_signal_played(self) -> None:
+        if (
+            self.personality
+            and "gemini" in self.personality.assistant_model.api_name.lower()
+        ):
+            return
+        
         self.record_audio(
             MAX_SILENT_SECONDS_BEFORE,
             self.personality.pause_threshold,
             self.if_cycle_not_changed(self.on_stopped_recording),
             self.if_cycle_not_changed(self.on_transcribed_text_received),
         )
+
         self.set_is_listening(self.state.chat_id, True)
 
+    def _on_stop_signal_played(self) -> None:
+        # signal all four sub-loops to exit
+        self.get_logger().info("_on_stop_signal_played")
+
     def on_stopped_recording(self) -> None:
+        if (
+            self.personality
+            and "gemini" in self.personality.assistant_model.api_name.lower()
+        ):
+            return
+
         if not self.get_is_listening(self.state.chat_id):
             return
-        self.play_audio_from_file(STOP_SIGNAL_FILE)
+        
+        self.play_audio_from_file(
+            STOP_SIGNAL_FILE,
+        )
         self.set_is_listening(self.state.chat_id, False)
         self.waiting_for_transcribed_text = True
 
@@ -344,6 +373,9 @@ class VoiceAssistantNode(Node):
         )
 
     def on_sentence_received(self, sentence: str, is_final: bool) -> None:
+        if self.gemini_loop.is_listening:
+            return
+        
         if not sentence:
             self.update_state(False)
             return
@@ -429,7 +461,6 @@ class VoiceAssistantNode(Node):
     def set_is_listening(self, chat_id: str, listening: bool) -> None:
         """updates and publishes the listening status of a chat"""
         self.chat_id_to_is_listening[chat_id] = listening
-
         chat_is_listening = ChatIsListening()
         chat_is_listening.listening = listening
         chat_is_listening.chat_id = chat_id
@@ -448,6 +479,36 @@ class VoiceAssistantNode(Node):
 
     def update_state(self, turned_on: bool, chat_id: str = "") -> bool:
         """attempts to update the internal state, and returns whether this was successful"""
+        import traceback
+        stack = "".join(traceback.format_stack(limit=5))
+        self.get_logger().info(f"Call stack (most recent 5 frames):\n{stack}")
+        self.get_logger().info(f"set_is_listening called: api_name={self.personality.assistant_model.api_name.lower()}")
+
+        if (
+            self.personality
+            and "gemini" in self.personality.assistant_model.api_name.lower()
+        ):
+            current_chat_id = self.state.chat_id
+            
+            if turned_on == self.gemini_loop.is_listening:
+                raise Exception(
+                        f"voice assistant is already turned {'on' if turned_on else 'off'}."
+                    )
+            
+            elif not turned_on:
+                self.gemini_loop.stop()
+                self.play_audio_from_file(STOP_SIGNAL_FILE)
+            
+            else:
+                self.gemini_loop.start()
+                self.play_audio_from_file(START_SIGNAL_FILE)
+
+            self.state.turned_on = turned_on
+            self.state.chat_id = chat_id
+
+            self.voice_assistant_state_publisher.publish(self.state)
+            return True
+        
         try:
             # ignore if currently turning off
             if self.turning_off:
@@ -458,6 +519,7 @@ class VoiceAssistantNode(Node):
                 raise Exception(
                     f"voice assistant is already turned {'on' if turned_on else 'off'}."
                 )
+
 
             # deactivate voice assistant
             elif not turned_on:
