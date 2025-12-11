@@ -22,6 +22,7 @@ COPY ./ros_packages/requirements.txt .
 RUN pip install requests
 RUN pip install pyaudio
 RUN pip install google-genai
+RUN pip install websockets
 
 COPY ./pib_api/client ./client
 RUN pip install ./client

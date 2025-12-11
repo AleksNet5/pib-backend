@@ -8,6 +8,8 @@
 # - Handles Stop/Start robustly by closing the live session and joining the worker thread.
 
 import asyncio
+import base64
+import json
 import os
 import logging
 import threading
@@ -33,6 +35,7 @@ from datatypes.srv import CreateOrUpdateChatMessage
 
 import queue
 import time
+import websockets
 
 # ——— Logging ———
 logging.basicConfig(
@@ -232,6 +235,8 @@ class GeminiAudioLoop:
 
         # Event loop reference (used by stop() to close session)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self.proxy_ws_url = os.getenv("GEMINI_PROXY_WS_URL", "").strip()
+        self._proxy_ws = None
 
     @property
     def is_listening(self) -> bool:
@@ -300,6 +305,18 @@ class GeminiAudioLoop:
                         pass
 
                 asyncio.run_coroutine_threadsafe(_close(), self._loop)
+            except Exception:
+                pass
+        if self._loop and self._proxy_ws is not None:
+            try:
+
+                async def _close_ws():
+                    try:
+                        await self._proxy_ws.close()
+                    except Exception:
+                        pass
+
+                asyncio.run_coroutine_threadsafe(_close_ws(), self._loop)
             except Exception:
                 pass
 
@@ -551,6 +568,15 @@ class GeminiAudioLoop:
         except queue.Full:
             logger.debug("Chat worker queue full, dropping chat update.")
 
+    async def _wait_for_tasks(self, tasks: list[asyncio.Task]):
+        """Wait for tasks until the first exception and re-raise for shared teardown."""
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+        for t in done:
+            if t.exception():
+                raise t.exception()
+
     # ---------- tasks ----------
 
     async def _listen_from_ros(self):
@@ -580,6 +606,94 @@ class GeminiAudioLoop:
             raise
         except Exception:
             logger.exception("send_realtime error")
+
+    async def _proxy_sender(self, ws):
+        """Forward PCM chunks from out_queue to the proxy websocket."""
+        try:
+            while not self._stop_event.is_set():
+                msg = await self.out_queue.get()
+                data = b""
+                if isinstance(msg, dict):
+                    data = msg.get("data", b"")
+                elif isinstance(msg, (bytes, bytearray)):
+                    data = bytes(msg)
+                if not data:
+                    continue
+                await ws.send(data)
+        except asyncio.CancelledError:
+            logger.debug("_proxy_sender: cancelled")
+            raise
+        except Exception:
+            logger.exception("_proxy_sender error")
+            self._stop_event.set()
+
+    async def _proxy_receiver(self, ws):
+        """Handle messages from the proxy websocket and feed audio + text locally."""
+        try:
+            while not self._stop_event.is_set():
+                msg = await ws.recv()
+                if isinstance(msg, bytes):
+                    # Unexpected text as bytes; ignore.
+                    continue
+
+                payload = {}
+                try:
+                    payload = json.loads(msg)
+                except Exception:
+                    logger.debug("proxy_receiver: non-JSON message ignored")
+                    continue
+
+                mtype = payload.get("type")
+                if mtype == "input_text":
+                    text_piece = (payload.get("text") or "").strip()
+                    if text_piece:
+                        if self._current_role != "user":
+                            self._start_new_stream("user")
+                        self._send_chat_piece(
+                            text_piece,
+                            is_user=True,
+                            update_db=True,
+                            force_flush=False,
+                        )
+                elif mtype == "output_text":
+                    text_piece = (payload.get("text") or "").strip()
+                    if text_piece:
+                        if self._current_role != "assistant":
+                            self._start_new_stream("assistant")
+                        self._send_chat_piece(
+                            text_piece,
+                            is_user=False,
+                            update_db=True,
+                            force_flush=True,
+                        )
+                elif mtype == "audio":
+                    audio_b64 = payload.get("audio_b64") or ""
+                    if not audio_b64:
+                        continue
+                    try:
+                        pcm = base64.b64decode(audio_b64)
+                    except Exception:
+                        logger.debug("proxy_receiver: failed to decode audio chunk")
+                        continue
+
+                    assistant_text_piece = payload.get("text")
+                    try:
+                        self.audio_in_queue.put_nowait((pcm, assistant_text_piece))
+                    except asyncio.QueueFull:
+                        logger.warning(
+                            "Audio input queue is full; dropping data chunk."
+                        )
+                else:
+                    logger.debug("proxy_receiver: unknown message type %s", mtype)
+        except asyncio.CancelledError:
+            logger.debug("_proxy_receiver: cancelled")
+            raise
+        except websockets.exceptions.ConnectionClosed:
+            logger.info("Proxy websocket closed.")
+            self._stop_event.set()
+        except Exception:
+            logger.exception("_proxy_receiver error")
+            self._stop_event.set()
 
     def _log_user_transcriptions(self, sc):
         """
@@ -745,13 +859,15 @@ class GeminiAudioLoop:
     async def run(self):
         """
         Main async entry:
-        - Opens Gemini live session (genai client)
+        - If GEMINI_PROXY_WS_URL is set, route traffic via websocket proxy
+        - Otherwise, connect directly to Gemini live session
         - Starts ROS bridge + 3 tasks (listen/send/receive/play)
         - Waits for first exception to shut down everything together
         """
-        client = genai.Client(api_key=self.api_key)
+        client = genai.Client(api_key=self.api_key) if not self.proxy_ws_url else None
         ros_started = False
-        tasks = []
+        tasks: list[asyncio.Task] = []
+        ws = None
         try:
             # Read chat personality/description from PIB to seed the model
             successful, personality = voice_assistant_client.get_personality_from_chat(
@@ -761,49 +877,55 @@ class GeminiAudioLoop:
                 logger.error(f"no personality found for id {self._chat_id}")
             description = (
                 personality.description
-                if personality.description is not None
+                if personality and personality.description is not None
                 else "You are pib, a humanoid robot."
             )
 
             gemini_config = dict(CONFIG)
             gemini_config["system_instruction"] = description
 
-            # Live session
-            async with client.aio.live.connect(
-                model=MODEL, config=gemini_config
-            ) as session:
-                self.session = session
-                self.audio_in_queue = asyncio.Queue[tuple[bytes, Optional[str]]]()
-                self.out_queue = asyncio.Queue(maxsize=5)
-                self._log_lock = asyncio.Lock()
+            # Init shared queues and logging locks
+            self.audio_in_queue = asyncio.Queue[tuple[bytes, Optional[str]]]()
+            self.out_queue = asyncio.Queue(maxsize=5)
+            self._log_lock = asyncio.Lock()
+            await self._ensure_log_dirs()
 
-                # Optional folders for WAV logs
-                await self._ensure_log_dirs()
+            # Start ROS subscriber thread that feeds PCM into out_queue
+            topic = os.getenv("ROS_AUDIO_TOPIC", "audio_stream")
+            self._ros_bridge = RosAudioBridge(
+                topic, asyncio.get_running_loop(), self.out_queue
+            )
+            self._ros_bridge.start()
+            ros_started = True
+            logger.info("RosAudioBridge started.")
 
-                # Start ROS subscriber thread that feeds PCM into out_queue
-                topic = os.getenv("ROS_AUDIO_TOPIC", "audio_stream")
-                self._ros_bridge = RosAudioBridge(
-                    topic, asyncio.get_running_loop(), self.out_queue
-                )
-                self._ros_bridge.start()
-                ros_started = True
-                logger.info("RosAudioBridge started.")
+            # Branch: proxy or direct
+            if self.proxy_ws_url:
+                logger.info("Using Gemini proxy websocket at %s", self.proxy_ws_url)
+                ws = await websockets.connect(self.proxy_ws_url)
+                self._proxy_ws = ws
+                await ws.send(json.dumps({"model": MODEL, "config": gemini_config}))
 
-                # Start async tasks
                 tasks = [
                     asyncio.create_task(self._listen_from_ros()),
-                    asyncio.create_task(self.send_realtime()),
-                    asyncio.create_task(self.receive_audio()),
+                    asyncio.create_task(self._proxy_sender(ws)),
+                    asyncio.create_task(self._proxy_receiver(ws)),
                     asyncio.create_task(self.play_audio()),
                 ]
+                await self._wait_for_tasks(tasks)
+            else:
+                async with client.aio.live.connect(
+                    model=MODEL, config=gemini_config
+                ) as session:
+                    self.session = session
 
-                # Wait until one task errors, then tear down everything
-                done, pending = await asyncio.wait(
-                    tasks, return_when=asyncio.FIRST_EXCEPTION
-                )
-                for t in done:
-                    if t.exception():
-                        raise t.exception()
+                    tasks = [
+                        asyncio.create_task(self._listen_from_ros()),
+                        asyncio.create_task(self.send_realtime()),
+                        asyncio.create_task(self.receive_audio()),
+                        asyncio.create_task(self.play_audio()),
+                    ]
+                    await self._wait_for_tasks(tasks)
 
         except asyncio.CancelledError:
             logger.debug("GeminiAudioLoop.run: cancelled")
@@ -840,6 +962,13 @@ class GeminiAudioLoop:
                 await self._close_turn_logs()
             except Exception:
                 pass
+
+            if ws:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+            self._proxy_ws = None
 
             logger.info("GeminiAudioLoop.run: terminated")
 
