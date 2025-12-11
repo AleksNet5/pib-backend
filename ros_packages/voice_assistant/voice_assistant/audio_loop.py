@@ -36,6 +36,7 @@ from datatypes.srv import CreateOrUpdateChatMessage
 import queue
 import time
 import websockets
+from types import SimpleNamespace
 
 # ——— Logging ———
 logging.basicConfig(
@@ -556,30 +557,9 @@ class GeminiAudioLoop:
         if self._stop_event.is_set() or not self._is_listening:
             return
 
-        # 1) Update accumulator with de-duplication but allow growth
+        # 1) Update accumulator (append text as-is)
         if text_piece:
-            current = self._accum_text or ""
-            incoming = text_piece.strip()
-
-            if is_user:
-                # User transcript tends to be incremental; append if not duplicate suffix.
-                if incoming and not current.endswith(incoming):
-                    new_accum = (current + " " + incoming).strip()
-                else:
-                    new_accum = current or incoming
-            else:
-                # Assistant transcript may repeat prefixes. Prefer the longer string when it
-                # contains the current prefix; append otherwise.
-                if incoming.startswith(current):
-                    new_accum = incoming
-                elif current.startswith(incoming):
-                    new_accum = current
-                else:
-                    new_accum = (current + " " + incoming).strip()
-
-            if new_accum == self._accum_text:
-                return
-            self._accum_text = new_accum
+            self._accum_text = (self._accum_text + " " + text_piece).strip()
 
         if not self._accum_text:
             return
@@ -645,11 +625,12 @@ class GeminiAudioLoop:
                 data = b""
                 if isinstance(msg, dict):
                     data = msg.get("data", b"")
-                elif isinstance(msg, (bytes, bytearray)):
+                if isinstance(msg, (bytes, bytearray)):
                     data = bytes(msg)
-                if not data:
-                    continue
-                await ws.send(data)
+
+                # Mirror receive path structure: allow future expansion for control/text frames.
+                if data:
+                    await ws.send(data)
         except asyncio.CancelledError:
             logger.debug("_proxy_sender: cancelled")
             raise
@@ -663,7 +644,7 @@ class GeminiAudioLoop:
     async def _proxy_receiver(self, ws):
         """Handle messages from the proxy websocket and feed audio + text locally."""
         try:
-            pending_assistant_text: Optional[str] = None
+            assistant_text_piece: Optional[str] = None
             while not self._stop_event.is_set():
                 msg = await ws.recv()
                 if isinstance(msg, bytes):
@@ -677,51 +658,23 @@ class GeminiAudioLoop:
                     logger.debug("proxy_receiver: non-JSON message ignored")
                     continue
 
-                mtype = payload.get("type")
-                if mtype == "input_text":
-                    text_piece = (payload.get("text") or "").strip()
-                    if text_piece:
-                        if self._current_role != "user":
-                            self._start_new_stream("user")
-                        self._send_chat_piece(
-                            text_piece,
-                            is_user=True,
-                            update_db=True,
-                            force_flush=False,
-                        )
-                elif mtype == "output_text":
-                    text_piece = (payload.get("text") or "").strip()
-                    if text_piece:
-                        pending_assistant_text = text_piece
-                        if self._current_role != "assistant":
-                            self._start_new_stream("assistant")
-                        self._send_chat_piece(
-                            text_piece,
-                            is_user=False,
-                            update_db=True,
-                            force_flush=True,
-                        )
-                elif mtype == "audio":
-                    audio_b64 = payload.get("audio_b64") or ""
-                    if not audio_b64:
-                        continue
+                # Decode payload into a resp-like object so we can reuse receive_audio logic.
+                data_bytes = None
+                if payload.get("data_b64"):
                     try:
-                        pcm = base64.b64decode(audio_b64)
+                        data_bytes = base64.b64decode(payload["data_b64"])
                     except Exception:
                         logger.debug("proxy_receiver: failed to decode audio chunk")
                         continue
+                server_content = payload.get("server_content")
+                text_field = payload.get("text")
 
-                    assistant_text_piece = payload.get("text") or pending_assistant_text
-                    if assistant_text_piece:
-                        pending_assistant_text = None
-                    try:
-                        self.audio_in_queue.put_nowait((pcm, assistant_text_piece))
-                    except asyncio.QueueFull:
-                        logger.warning(
-                            "Audio input queue is full; dropping data chunk."
-                        )
-                else:
-                    logger.debug("proxy_receiver: unknown message type %s", mtype)
+                resp_like = SimpleNamespace(
+                    data=data_bytes, text=text_field, server_content=server_content
+                )
+                assistant_text_piece = self._process_gemini_resp(
+                    resp_like, assistant_text_piece
+                )
         except asyncio.CancelledError:
             logger.debug("_proxy_receiver: cancelled")
             raise
@@ -759,11 +712,21 @@ class GeminiAudioLoop:
         Extract assistant (Gemini) text from server_content without sending it.
         Return the text string or None.
         """
-        output_transcription = getattr(sc, "output_transcription", None)
+        output_transcription = None
+        if sc is None:
+            return None
+        if isinstance(sc, dict):
+            output_transcription = sc.get("output_transcription")
+        else:
+            output_transcription = getattr(sc, "output_transcription", None)
         if not output_transcription:
             return None
 
-        txt = getattr(output_transcription, "text", None)
+        txt = (
+            output_transcription.get("text")
+            if isinstance(output_transcription, dict)
+            else getattr(output_transcription, "text", None)
+        )
         if txt:
             text_piece = txt.strip()
             logger.debug(
@@ -772,6 +735,52 @@ class GeminiAudioLoop:
             return text_piece
 
         return None
+
+    def _process_gemini_resp(
+        self, resp: Any, assistant_text_piece: Optional[str]
+    ) -> Optional[str]:
+        """
+        Common handler for Gemini responses (direct or via proxy).
+        - sc: server_content (object or dict)
+        - data: PCM bytes (or None)
+        - text: plain text field (rare)
+        Returns updated assistant_text_piece (buffered until paired with audio).
+        """
+        sc = getattr(resp, "server_content", None)
+        if sc is None and isinstance(resp, dict):
+            sc = resp.get("server_content")
+
+        if sc is not None:
+            # User text is sent immediately
+            self._log_user_transcriptions(sc)
+            # Assistant text is buffered
+            new_piece = self._extract_assistant_text(sc)
+            if new_piece:
+                assistant_text_piece = new_piece
+                logger.debug(f"Buffered for upcoming audio: {assistant_text_piece}")
+
+        # Audio
+        data = getattr(resp, "data", None)
+        if data is None and isinstance(resp, dict):
+            data = resp.get("data")
+        if data:
+            try:
+                queued_text = assistant_text_piece
+                logger.debug(f"Queueing audio with text: {queued_text}")
+                self.audio_in_queue.put_nowait((data, assistant_text_piece))
+                if assistant_text_piece is not None:
+                    assistant_text_piece = None
+            except asyncio.QueueFull:
+                logger.warning("Audio input queue is full; dropping data chunk.")
+        else:
+            # Occasionally text responses arrive without audio; print for debugging
+            txt = getattr(resp, "text", None)
+            if txt is None and isinstance(resp, dict):
+                txt = resp.get("text")
+            if txt:
+                print(txt, end="")
+
+        return assistant_text_piece
 
     async def receive_audio(self):
         """
@@ -793,44 +802,13 @@ class GeminiAudioLoop:
                 logger.error(f"Failed to open turn logs: {e}")
                 continue
 
-            turn = None
             try:
                 turn = self.session.receive()
                 assistant_text_piece: Optional[str] = None
                 async for resp in turn:
-                    # Handle transcripts (user now, assistant buffered)
-                    sc = getattr(resp, "server_content", None)
-                    if sc is not None:
-                        # User text is sent immediately
-                        self._log_user_transcriptions(sc)
-                        # Assistant text is only extracted and passed along
-                        new_piece = self._extract_assistant_text(sc)
-                        if new_piece:
-                            assistant_text_piece = new_piece
-                            logger.debug(
-                                f"Buffered for upcoming audio: {assistant_text_piece}"
-                            )
-
-                    if data := getattr(resp, "data", None):
-                        # PCM audio from Gemini (24k mono)
-                        try:
-                            # Put a pair: (pcm_bytes, assistant_text_piece or None)
-                            queued_text = assistant_text_piece
-                            logger.debug(f"Queueing audio with text: {queued_text}")
-
-                            self.audio_in_queue.put_nowait((data, assistant_text_piece))
-                            if assistant_text_piece is not None:
-                                assistant_text_piece = None
-                            # If desired, uncomment to log output audio:
-                            # await self._log_output_bytes(data)
-                        except asyncio.QueueFull:
-                            logger.warning(
-                                "Audio input queue is full; dropping data chunk."
-                            )
-                    elif text := getattr(resp, "text", None):
-                        # Occasionally text responses arrive without audio; print for debugging
-                        print(text, end="")
-
+                    assistant_text_piece = self._process_gemini_resp(
+                        resp, assistant_text_piece
+                    )
                     if self._stop_event.is_set():
                         # Stop requested -> break out and let run() tear down
                         break

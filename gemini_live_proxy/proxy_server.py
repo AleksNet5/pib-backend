@@ -63,10 +63,8 @@ async def _gemini_to_client(
 ) -> None:
     """
     Receive events from Gemini live session and push them to the websocket client.
-    Format:
-      - {"type": "input_text", "text": "..."}       (user transcript)
-      - {"type": "output_text", "text": "..."}      (assistant transcript)
-      - {"type": "audio", "audio_b64": "...", "text": optional_assistant_text}
+    Sends a JSON serialization of the original response so the client can process
+    it similarly to a direct Gemini connection.
     """
     try:
         while not stop_event.is_set():
@@ -75,38 +73,42 @@ async def _gemini_to_client(
                 if stop_event.is_set():
                     break
 
+                payload = {}
+
+                # server_content transcripts
                 sc = getattr(resp, "server_content", None)
                 if sc:
+                    sc_payload = {}
                     input_transcription = getattr(sc, "input_transcription", None)
                     if input_transcription and getattr(input_transcription, "text", None):
-                        await websocket.send_text(
-                            json.dumps(
-                                {"type": "input_text", "text": input_transcription.text}
-                            )
-                        )
-
+                        sc_payload["input_transcription"] = {
+                            "text": input_transcription.text
+                        }
                     output_transcription = getattr(sc, "output_transcription", None)
                     if output_transcription and getattr(output_transcription, "text", None):
                         pending_assistant_text = output_transcription.text
-                        await websocket.send_text(
-                            json.dumps(
-                                {"type": "output_text", "text": output_transcription.text}
-                            )
-                        )
+                        sc_payload["output_transcription"] = {
+                            "text": output_transcription.text
+                        }
+                    if sc_payload:
+                        payload["server_content"] = sc_payload
 
+                # audio data
                 if data := getattr(resp, "data", None):
-                    payload = {
-                        "type": "audio",
-                        "audio_b64": base64.b64encode(data).decode("ascii"),
-                    }
+                    payload["data_b64"] = base64.b64encode(data).decode("ascii")
                     if pending_assistant_text:
-                        payload["text"] = pending_assistant_text
+                        payload.setdefault("server_content", {})
+                        payload["server_content"]["output_transcription"] = {
+                            "text": pending_assistant_text
+                        }
                         pending_assistant_text = None
+
+                # plain text messages
+                if text := getattr(resp, "text", None):
+                    payload["text"] = text
+
+                if payload:
                     await websocket.send_text(json.dumps(payload))
-                elif text := getattr(resp, "text", None):
-                    await websocket.send_text(
-                        json.dumps({"type": "output_text", "text": text})
-                    )
     except Exception:
         if not stop_event.is_set():
             logger.exception("Error streaming from Gemini to client")
