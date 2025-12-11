@@ -556,9 +556,18 @@ class GeminiAudioLoop:
         if self._stop_event.is_set() or not self._is_listening:
             return
 
-        # 1) Update accumulator
+        # 1) Update accumulator (assistant replaces with latest string; user appends)
         if text_piece:
-            self._accum_text = (self._accum_text + " " + text_piece).strip()
+            if is_user:
+                new_accum = (self._accum_text + " " + text_piece).strip()
+            else:
+                # For assistant, prefer the most recent full string to avoid repeats.
+                new_accum = text_piece
+                if len(self._accum_text) > len(new_accum):
+                    new_accum = self._accum_text
+            if new_accum == self._accum_text:
+                return
+            self._accum_text = new_accum
 
         if not self._accum_text:
             return
