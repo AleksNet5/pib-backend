@@ -642,6 +642,7 @@ class GeminiAudioLoop:
     async def _proxy_receiver(self, ws):
         """Handle messages from the proxy websocket and feed audio + text locally."""
         try:
+            pending_assistant_text: Optional[str] = None
             while not self._stop_event.is_set():
                 msg = await ws.recv()
                 if isinstance(msg, bytes):
@@ -670,6 +671,7 @@ class GeminiAudioLoop:
                 elif mtype == "output_text":
                     text_piece = (payload.get("text") or "").strip()
                     if text_piece:
+                        pending_assistant_text = text_piece
                         if self._current_role != "assistant":
                             self._start_new_stream("assistant")
                         self._send_chat_piece(
@@ -688,7 +690,9 @@ class GeminiAudioLoop:
                         logger.debug("proxy_receiver: failed to decode audio chunk")
                         continue
 
-                    assistant_text_piece = payload.get("text")
+                    assistant_text_piece = payload.get("text") or pending_assistant_text
+                    if assistant_text_piece:
+                        pending_assistant_text = None
                     try:
                         self.audio_in_queue.put_nowait((pcm, assistant_text_piece))
                     except asyncio.QueueFull:
