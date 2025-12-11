@@ -68,42 +68,45 @@ async def _gemini_to_client(
       - {"type": "output_text", "text": "..."}      (assistant transcript)
       - {"type": "audio", "audio_b64": "...", "text": optional_assistant_text}
     """
-    pending_assistant_text: Optional[str] = None
     try:
-        async for resp in session.receive():
-            if stop_event.is_set():
-                break
+        while not stop_event.is_set():
+            pending_assistant_text: Optional[str] = None
+            async for resp in session.receive():
+                if stop_event.is_set():
+                    break
 
-            sc = getattr(resp, "server_content", None)
-            if sc:
-                input_transcription = getattr(sc, "input_transcription", None)
-                if input_transcription and getattr(input_transcription, "text", None):
-                    await websocket.send_text(
-                        json.dumps(
-                            {"type": "input_text", "text": input_transcription.text}
+                sc = getattr(resp, "server_content", None)
+                if sc:
+                    input_transcription = getattr(sc, "input_transcription", None)
+                    if input_transcription and getattr(input_transcription, "text", None):
+                        await websocket.send_text(
+                            json.dumps(
+                                {"type": "input_text", "text": input_transcription.text}
+                            )
                         )
-                    )
 
-                output_transcription = getattr(sc, "output_transcription", None)
-                if output_transcription and getattr(output_transcription, "text", None):
-                    pending_assistant_text = output_transcription.text
-                    await websocket.send_text(
-                        json.dumps(
-                            {"type": "output_text", "text": output_transcription.text}
+                    output_transcription = getattr(sc, "output_transcription", None)
+                    if output_transcription and getattr(output_transcription, "text", None):
+                        pending_assistant_text = output_transcription.text
+                        await websocket.send_text(
+                            json.dumps(
+                                {"type": "output_text", "text": output_transcription.text}
+                            )
                         )
-                    )
 
-            if data := getattr(resp, "data", None):
-                payload = {
-                    "type": "audio",
-                    "audio_b64": base64.b64encode(data).decode("ascii"),
-                }
-                if pending_assistant_text:
-                    payload["text"] = pending_assistant_text
-                    pending_assistant_text = None
-                await websocket.send_text(json.dumps(payload))
-            elif text := getattr(resp, "text", None):
-                await websocket.send_text(json.dumps({"type": "output_text", "text": text}))
+                if data := getattr(resp, "data", None):
+                    payload = {
+                        "type": "audio",
+                        "audio_b64": base64.b64encode(data).decode("ascii"),
+                    }
+                    if pending_assistant_text:
+                        payload["text"] = pending_assistant_text
+                        pending_assistant_text = None
+                    await websocket.send_text(json.dumps(payload))
+                elif text := getattr(resp, "text", None):
+                    await websocket.send_text(
+                        json.dumps({"type": "output_text", "text": text})
+                    )
     except Exception:
         if not stop_event.is_set():
             logger.exception("Error streaming from Gemini to client")
@@ -117,7 +120,7 @@ async def websocket_proxy(websocket: WebSocket):
 
     api_key = os.getenv("GOOGLE_API_KEY", "")
     if not api_key:
-        await websocket.close(code=4001)
+        await websocket.close(code=4401, reason="missing GOOGLE_API_KEY")
         return
 
     # Expect first message as JSON with model + config (system_instruction, modalities, etc.)

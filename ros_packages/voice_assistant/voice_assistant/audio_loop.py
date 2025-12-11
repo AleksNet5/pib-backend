@@ -146,6 +146,9 @@ class RosAudioBridge:
                             {"data": payload, "mime_type": "audio/pcm"}
                         )
 
+                    # If loop is gone, just drop gracefully.
+                    if self._loop.is_closed():
+                        return
                     try:
                         fut = asyncio.run_coroutine_threadsafe(_put(), self._loop)
                         fut.result(timeout=0.25)
@@ -307,16 +310,22 @@ class GeminiAudioLoop:
                 asyncio.run_coroutine_threadsafe(_close(), self._loop)
             except Exception:
                 pass
-        if self._loop and self._proxy_ws is not None:
+            if self._loop and self._proxy_ws is not None:
+                try:
+
+                    async def _close_ws():
+                        try:
+                            await self._proxy_ws.close()
+                        except Exception:
+                            pass
+
+                    asyncio.run_coroutine_threadsafe(_close_ws(), self._loop)
+                except Exception:
+                    pass
+        # If loop already went away, ensure proxy ws closes best-effort
+        elif self._proxy_ws is not None:
             try:
-
-                async def _close_ws():
-                    try:
-                        await self._proxy_ws.close()
-                    except Exception:
-                        pass
-
-                asyncio.run_coroutine_threadsafe(_close_ws(), self._loop)
+                asyncio.run(self._proxy_ws.close())
             except Exception:
                 pass
 
@@ -623,6 +632,9 @@ class GeminiAudioLoop:
         except asyncio.CancelledError:
             logger.debug("_proxy_sender: cancelled")
             raise
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.info("Proxy websocket closed (%s).", e.code)
+            self._stop_event.set()
         except Exception:
             logger.exception("_proxy_sender error")
             self._stop_event.set()
