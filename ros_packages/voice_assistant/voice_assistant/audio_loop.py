@@ -556,15 +556,27 @@ class GeminiAudioLoop:
         if self._stop_event.is_set() or not self._is_listening:
             return
 
-        # 1) Update accumulator (assistant replaces with latest string; user appends)
+        # 1) Update accumulator with de-duplication but allow growth
         if text_piece:
+            current = self._accum_text or ""
+            incoming = text_piece.strip()
+
             if is_user:
-                new_accum = (self._accum_text + " " + text_piece).strip()
+                # User transcript tends to be incremental; append if not duplicate suffix.
+                if incoming and not current.endswith(incoming):
+                    new_accum = (current + " " + incoming).strip()
+                else:
+                    new_accum = current or incoming
             else:
-                # For assistant, prefer the most recent full string to avoid repeats.
-                new_accum = text_piece
-                if len(self._accum_text) > len(new_accum):
-                    new_accum = self._accum_text
+                # Assistant transcript may repeat prefixes. Prefer the longer string when it
+                # contains the current prefix; append otherwise.
+                if incoming.startswith(current):
+                    new_accum = incoming
+                elif current.startswith(incoming):
+                    new_accum = current
+                else:
+                    new_accum = (current + " " + incoming).strip()
+
             if new_accum == self._accum_text:
                 return
             self._accum_text = new_accum
