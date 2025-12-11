@@ -103,10 +103,6 @@ async def _gemini_to_client(
                         }
                         pending_assistant_text = None
 
-                # plain text messages
-                if text := getattr(resp, "text", None):
-                    payload["text"] = text
-
                 if payload:
                     await websocket.send_text(json.dumps(payload))
     except Exception:

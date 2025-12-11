@@ -667,7 +667,7 @@ class GeminiAudioLoop:
                         logger.debug("proxy_receiver: failed to decode audio chunk")
                         continue
                 server_content = payload.get("server_content")
-                text_field = payload.get("text")
+                text_field = None  # proxy no longer sends plain text
 
                 resp_like = SimpleNamespace(
                     data=data_bytes, text=text_field, server_content=server_content
@@ -693,12 +693,21 @@ class GeminiAudioLoop:
         if self._stop_event.is_set() or not self._is_listening:
             return
 
-        # User stream
-        input_transcription = getattr(sc, "input_transcription", None)
-        if input_transcription and getattr(input_transcription, "text", None):
-            text_piece = input_transcription.text.strip()
+        # User stream (supports object or dict)
+        input_transcription = (
+            sc.get("input_transcription") if isinstance(sc, dict) else getattr(sc, "input_transcription", None)
+        )
+        txt = (
+            input_transcription.get("text")
+            if isinstance(input_transcription, dict)
+            else getattr(input_transcription, "text", None)
+        )
+        if txt:
+            text_piece = txt.strip()
+            logger.info("User transcript piece received: %s", text_piece)
             logger.debug(f"User: {text_piece}")
             if self._current_role != "user":
+                logger.info("Starting new user stream for chat_id=%s", self._chat_id)
                 self._start_new_stream("user")
             self._send_chat_piece(
                 text_piece,
@@ -706,6 +715,8 @@ class GeminiAudioLoop:
                 update_db=True,
                 force_flush=False,
             )
+        else:
+            logger.info("User transcript missing or empty in server_content: %s", sc)
 
     def _extract_assistant_text(self, sc) -> Optional[str]:
         """
@@ -758,6 +769,10 @@ class GeminiAudioLoop:
             if new_piece:
                 assistant_text_piece = new_piece
                 logger.debug(f"Buffered for upcoming audio: {assistant_text_piece}")
+            else:
+                logger.info("No assistant transcription text present in server_content: %s", sc)
+        else:
+            logger.info("No server_content present in response: %s", resp)
 
         # Audio
         data = getattr(resp, "data", None)
@@ -772,13 +787,6 @@ class GeminiAudioLoop:
                     assistant_text_piece = None
             except asyncio.QueueFull:
                 logger.warning("Audio input queue is full; dropping data chunk.")
-        else:
-            # Occasionally text responses arrive without audio; print for debugging
-            txt = getattr(resp, "text", None)
-            if txt is None and isinstance(resp, dict):
-                txt = resp.get("text")
-            if txt:
-                print(txt, end="")
 
         return assistant_text_piece
 
