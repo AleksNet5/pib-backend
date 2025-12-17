@@ -18,6 +18,8 @@ logger = logging.getLogger("GeminiLiveProxy")
 
 app = FastAPI()
 
+DEFAULT_AUDIO_MIME_TYPE = "audio/pcm;rate=16000"
+
 
 @app.get("/health", response_class=PlainTextResponse)
 async def health() -> str:
@@ -25,7 +27,10 @@ async def health() -> str:
 
 
 async def _client_to_gemini(
-    websocket: WebSocket, session, stop_event: asyncio.Event
+    websocket: WebSocket,
+    session,
+    stop_event: asyncio.Event,
+    audio_mime_type: str,
 ) -> None:
     """
     Forward binary audio frames from the websocket to Gemini live session.
@@ -50,7 +55,7 @@ async def _client_to_gemini(
         if msg.get("bytes") is not None:
             try:
                 await session.send_realtime_input(
-                    audio={"data": msg["bytes"], "mime_type": "audio/pcm"}
+                    audio={"data": msg["bytes"], "mime_type": audio_mime_type}
                 )
             except Exception:
                 logger.exception("Failed to forward audio to Gemini")
@@ -133,13 +138,21 @@ async def websocket_proxy(websocket: WebSocket):
         "GEMINI_DEFAULT_MODEL", "gemini-2.5-flash-native-audio-preview-09-2025"
     )
     config = start.get("config", {})
+    audio_mime_type = (
+        start.get("audio_mime_type")
+        or os.getenv("GEMINI_AUDIO_MIME_TYPE")
+        or DEFAULT_AUDIO_MIME_TYPE
+    )
+    logger.info("Starting Gemini live session: model=%s, audio_mime=%s", model, audio_mime_type)
 
     client = genai.Client(api_key=api_key)
     stop_event = asyncio.Event()
     try:
         async with client.aio.live.connect(model=model, config=config) as session:
             tasks = [
-                asyncio.create_task(_client_to_gemini(websocket, session, stop_event)),
+                asyncio.create_task(
+                    _client_to_gemini(websocket, session, stop_event, audio_mime_type)
+                ),
                 asyncio.create_task(_gemini_to_client(websocket, session, stop_event)),
             ]
 

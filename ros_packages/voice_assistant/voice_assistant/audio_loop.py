@@ -53,6 +53,7 @@ CHANNELS = 1  # send mono to Gemini
 SEND_SAMPLE_RATE = 16000  # recorder publishes 16 kHz mono
 RECEIVE_SAMPLE_RATE = 24000  # model replies at 24 kHz
 CHUNK_SIZE = 1024
+PCM_MIME_TYPE = "audio/pcm;rate=16000"
 
 MODEL = "gemini-2.5-flash-native-audio-preview-09-2025"
 CONFIG = {
@@ -143,9 +144,7 @@ class RosAudioBridge:
                         return
 
                     async def _put():
-                        await self._queue.put(
-                            {"data": payload, "mime_type": "audio/pcm"}
-                        )
+                        await self._queue.put(payload)
 
                     # If loop is gone, just drop gracefully.
                     if self._loop.is_closed():
@@ -605,12 +604,12 @@ class GeminiAudioLoop:
         """Feeds PCM chunks from out_queue into the Gemini live session."""
         try:
             while not self._stop_event.is_set():
-                msg = await self.out_queue.get()
-                # If desired, uncomment to log input audio:
-                # data = msg.get("data", b"")
-                # if data:
-                #     await self._log_input_bytes(data)
-                await self.session.send_realtime_input(audio=msg)
+                pcm = await self.out_queue.get()
+                if not pcm:
+                    continue
+                await self.session.send_realtime_input(
+                    audio={"data": pcm, "mime_type": PCM_MIME_TYPE}
+                )
         except asyncio.CancelledError:
             logger.debug("send_realtime: cancelled")
             raise
@@ -621,16 +620,9 @@ class GeminiAudioLoop:
         """Forward PCM chunks from out_queue to the proxy websocket."""
         try:
             while not self._stop_event.is_set():
-                msg = await self.out_queue.get()
-                data = b""
-                if isinstance(msg, dict):
-                    data = msg.get("data", b"")
-                if isinstance(msg, (bytes, bytearray)):
-                    data = bytes(msg)
-
-                # Mirror receive path structure: allow future expansion for control/text frames.
-                if data:
-                    await ws.send(data)
+                pcm = await self.out_queue.get()
+                if pcm:
+                    await ws.send(pcm)
         except asyncio.CancelledError:
             logger.debug("_proxy_sender: cancelled")
             raise
@@ -927,7 +919,15 @@ class GeminiAudioLoop:
                 logger.info("Using Gemini proxy websocket at %s", self.proxy_ws_url)
                 ws = await websockets.connect(self.proxy_ws_url)
                 self._proxy_ws = ws
-                await ws.send(json.dumps({"model": MODEL, "config": gemini_config}))
+                await ws.send(
+                    json.dumps(
+                        {
+                            "model": MODEL,
+                            "config": gemini_config,
+                            "audio_mime_type": PCM_MIME_TYPE,
+                        }
+                    )
+                )
 
                 tasks = [
                     asyncio.create_task(self._listen_from_ros()),
