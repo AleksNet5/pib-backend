@@ -8,7 +8,6 @@
 # - Handles Stop/Start robustly by closing the live session and joining the worker thread.
 
 import asyncio
-import base64
 import json
 import os
 import logging
@@ -640,7 +639,11 @@ class GeminiAudioLoop:
             while not self._stop_event.is_set():
                 msg = await ws.recv()
                 if isinstance(msg, bytes):
-                    # Unexpected text as bytes; ignore.
+                    # Binary frames are audio
+                    resp_like = SimpleNamespace(data=msg, server_content=None, text=None)
+                    assistant_text_piece = self._process_gemini_resp(
+                        resp_like, assistant_text_piece
+                    )
                     continue
 
                 payload = {}
@@ -650,23 +653,13 @@ class GeminiAudioLoop:
                     logger.debug("proxy_receiver: non-JSON message ignored")
                     continue
 
-                # Decode payload into a resp-like object so we can reuse receive_audio logic.
-                data_bytes = None
-                if payload.get("data_b64"):
-                    try:
-                        data_bytes = base64.b64decode(payload["data_b64"])
-                    except Exception:
-                        logger.debug("proxy_receiver: failed to decode audio chunk")
-                        continue
                 server_content = payload.get("server_content")
-                text_field = None  # proxy no longer sends plain text
+                if server_content is None:
+                    logger.debug("proxy_receiver: JSON without server_content ignored")
+                    continue
 
-                resp_like = SimpleNamespace(
-                    data=data_bytes, text=text_field, server_content=server_content
-                )
-                assistant_text_piece = self._process_gemini_resp(
-                    resp_like, assistant_text_piece
-                )
+                resp_like = SimpleNamespace(data=None, text=None, server_content=server_content)
+                assistant_text_piece = self._process_gemini_resp(resp_like, assistant_text_piece)
         except asyncio.CancelledError:
             logger.debug("_proxy_receiver: cancelled")
             raise
@@ -763,8 +756,6 @@ class GeminiAudioLoop:
                 logger.debug(f"Buffered for upcoming audio: {assistant_text_piece}")
             else:
                 logger.info("No assistant transcription text present in server_content: %s", sc)
-        else:
-            logger.info("No server_content present in response: %s", resp)
 
         # Audio
         data = getattr(resp, "data", None)

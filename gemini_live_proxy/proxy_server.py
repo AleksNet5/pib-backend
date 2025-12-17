@@ -1,9 +1,7 @@
 import asyncio
-import base64
 import json
 import logging
 import os
-from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
@@ -68,22 +66,19 @@ async def _gemini_to_client(
 ) -> None:
     """
     Receive events from Gemini live session and push them to the websocket client.
-    Sends a JSON serialization of the original response so the client can process
-    it similarly to a direct Gemini connection.
+    - Audio is forwarded as binary websocket frames (no base64).
+    - Transcripts (server_content) are forwarded as JSON text frames.
     """
     try:
         while not stop_event.is_set():
-            pending_assistant_text: Optional[str] = None
             async for resp in session.receive():
                 if stop_event.is_set():
                     break
 
-                payload = {}
-
-                # server_content transcripts
+                # server_content transcripts -> JSON text frame
                 sc = getattr(resp, "server_content", None)
                 if sc:
-                    sc_payload = {}
+                    sc_payload: dict = {}
                     input_transcription = getattr(sc, "input_transcription", None)
                     if input_transcription and getattr(input_transcription, "text", None):
                         sc_payload["input_transcription"] = {
@@ -91,25 +86,20 @@ async def _gemini_to_client(
                         }
                     output_transcription = getattr(sc, "output_transcription", None)
                     if output_transcription and getattr(output_transcription, "text", None):
-                        pending_assistant_text = output_transcription.text
                         sc_payload["output_transcription"] = {
                             "text": output_transcription.text
                         }
                     if sc_payload:
-                        payload["server_content"] = sc_payload
+                        await websocket.send_text(json.dumps({"server_content": sc_payload}))
 
-                # audio data
+                # audio data -> binary frame
                 if data := getattr(resp, "data", None):
-                    payload["data_b64"] = base64.b64encode(data).decode("ascii")
-                    if pending_assistant_text:
-                        payload.setdefault("server_content", {})
-                        payload["server_content"]["output_transcription"] = {
-                            "text": pending_assistant_text
-                        }
-                        pending_assistant_text = None
-
-                if payload:
-                    await websocket.send_text(json.dumps(payload))
+                    try:
+                        await websocket.send_bytes(data)
+                    except Exception:
+                        logger.exception("Failed to forward audio frame to client")
+                        stop_event.set()
+                        break
     except Exception:
         if not stop_event.is_set():
             logger.exception("Error streaming from Gemini to client")
