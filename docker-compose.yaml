@@ -148,19 +148,6 @@ services:
       - pib-blockly-server
       - ros-audio-io
 
-  gemini-live-proxy:
-    build:
-      context: ./gemini_live_proxy
-    image: gemini_live_proxy
-    networks:
-      - pib-network
-    environment:
-      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - GEMINI_DEFAULT_MODEL=gemini-2.5-flash-native-audio-preview-09-2025
-    ports:
-      - "8081:8081"
-    restart: unless-stopped
-
   ros-programs:
     image: ros_programs
     build:
