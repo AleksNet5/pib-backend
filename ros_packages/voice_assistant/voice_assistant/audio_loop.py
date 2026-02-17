@@ -9,6 +9,7 @@
 
 import asyncio
 import json
+import base64
 import os
 import logging
 import threading
@@ -37,6 +38,8 @@ import time
 import websockets
 from types import SimpleNamespace
 
+import secrets
+
 # ——— Logging ———
 logging.basicConfig(
     level=logging.INFO,
@@ -61,6 +64,329 @@ CONFIG = {
     "output_audio_transcription": {},  # get assistant (output) transcript stream
 }
 ROS_AUDIO_TOPIC = os.getenv("ROS_AUDIO_TOPIC", "audio_stream")
+
+from types import SimpleNamespace
+import json
+
+from types import SimpleNamespace
+
+class ProxyLiveSession:
+    """
+    Live API *WebSocket envelope* client used with the two-socket proxy.
+
+    The proxy is a pure passthrough:
+      /up   expects text frames containing the official Live WS JSON envelope
+      /down returns text frames containing the official Live WS JSON envelope
+
+    This adapter makes it look like the Python GenAI SDK session:
+      - send_realtime_input(audio={"data": <bytes>, "mime_type": "audio/pcm;rate=16000"})
+      - receive() -> async generator of objects with:
+          * .data (bytes | None)           # decoded PCM (24kHz on output)
+          * .mime_type (str | None)
+          * .server_content (dict | None)  # snake_case keys: input_transcription/output_transcription/interrupted
+          * .text (str | None)
+    """
+
+    def __init__(self, ws_up, ws_down, *, model: str, config: dict):
+        self._ws_up = ws_up
+        self._ws_down = ws_down
+        self._model = model
+        self._config = dict(config or {})
+        self._setup_done = False
+
+        # Used to ensure only one consumer reads from _ws_down.
+        self._down_lock = asyncio.Lock()
+
+    # ----------------------------
+    # Setup / handshake
+    # ----------------------------
+
+    async def setup(self, *, timeout_s: float = 10.0) -> None:
+        """
+        Send the required first message: BidiGenerateContentSetup, then wait for setupComplete.
+        Per docs, no other messages should be sent before setupComplete.
+        """
+        # Build setup payload
+        setup_msg = {"setup": self._build_setup(self._model, self._config)}
+        await self._ws_up.send(json.dumps(setup_msg))
+
+        # Wait for setupComplete on /down
+        async with self._down_lock:
+            deadline = asyncio.get_event_loop().time() + timeout_s
+            while True:
+                remaining = max(0.1, deadline - asyncio.get_event_loop().time())
+                raw = await asyncio.wait_for(self._ws_down.recv(), timeout=remaining)
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", errors="replace")
+                if not isinstance(raw, str):
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+                if isinstance(msg, dict) and "setupComplete" in msg:
+                    self._setup_done = True
+                    return
+                # Ignore anything else pre-setup; (shouldn't happen normally)
+
+    @staticmethod
+    def _snake_to_camel_key(k: str) -> str:
+        # Minimal conversion for config keys we use.
+        parts = k.split("_")
+        return parts[0] + "".join(p[:1].upper() + p[1:] for p in parts[1:])
+
+    @classmethod
+    def _build_setup(cls, model: str, cfg: dict) -> dict:
+        """
+        Translate our existing snake_case config (from Python SDK) into the official setup schema.
+
+        Live WS expects:
+          {
+            "model": "models/...",
+            "generationConfig": { "responseModalities": [...] , ... },
+            "systemInstruction": { "parts": [{"text": "..."}] },
+            "inputAudioTranscription": {},
+            "outputAudioTranscription": {},
+            "realtimeInputConfig": {...},
+            "tools": [...]
+          }
+        """
+        # Model must be "models/<id>" in setup.
+        model_name = model if model.startswith("models/") else f"models/{model}"
+
+        setup: dict = {"model": model_name}
+
+        # --- generationConfig ---
+        gen_cfg: dict = {}
+        # Supported gen keys we might pass through.
+        gen_key_map = {
+            "candidate_count": "candidateCount",
+            "max_output_tokens": "maxOutputTokens",
+            "temperature": "temperature",
+            "top_p": "topP",
+            "top_k": "topK",
+            "presence_penalty": "presencePenalty",
+            "frequency_penalty": "frequencyPenalty",
+            "response_modalities": "responseModalities",
+            "speech_config": "speechConfig",
+            "media_resolution": "mediaResolution",
+        }
+        for sk, ck in gen_key_map.items():
+            if sk in cfg and cfg[sk] is not None:
+                gen_cfg[ck] = cfg[sk]
+        if gen_cfg:
+            setup["generationConfig"] = gen_cfg
+
+        # --- system instruction ---
+        sys_inst = cfg.get("system_instruction")
+        if sys_inst:
+            setup["systemInstruction"] = {"parts": [{"text": str(sys_inst)}]}
+
+        # --- tools ---
+        tools = cfg.get("tools")
+        if isinstance(tools, list) and tools:
+            setup["tools"] = tools
+
+        # --- transcription config (snake_case -> camelCase fields in setup) ---
+        if "input_audio_transcription" in cfg and cfg["input_audio_transcription"] is not None:
+            setup["inputAudioTranscription"] = cfg.get("input_audio_transcription") or {}
+        if "output_audio_transcription" in cfg and cfg["output_audio_transcription"] is not None:
+            setup["outputAudioTranscription"] = cfg.get("output_audio_transcription") or {}
+
+        # --- realtime input config ---
+        ric = cfg.get("realtime_input_config")
+        if isinstance(ric, dict) and ric:
+            # Best-effort camelCase conversion for first-level keys.
+            setup["realtimeInputConfig"] = {cls._snake_to_camel_key(k): v for k, v in ric.items()}
+
+        # --- extra v1alpha flags (best-effort passthrough) ---
+        for k in ("enable_affective_dialog", "proactivity", "session_resumption", "context_window_compression"):
+            if k in cfg and cfg[k] is not None:
+                setup[cls._snake_to_camel_key(k)] = cfg[k]
+
+        return setup
+
+    # ----------------------------
+    # SDK-like methods
+    # ----------------------------
+
+    async def send_realtime_input(self, *, audio=None, text=None, **kwargs):
+        """
+        Mirrors SDK send_realtime_input:
+        - audio -> {"realtimeInput": {"audio": {"data": "<b64>", "mimeType": "..."} } }
+        - text  -> {"clientContent": {"turns":[...], "turnComplete": true } }
+        """
+        if not self._setup_done:
+            # If caller forgot, do the handshake now.
+            await self.setup()
+
+        # audio stream end / activity markers (optional)
+        if kwargs.get("audio_stream_end"):
+            await self._ws_up.send(json.dumps({"realtimeInput": {"audioStreamEnd": True}}))
+            return
+        if kwargs.get("activity_start") is not None:
+            await self._ws_up.send(json.dumps({"realtimeInput": {"activityStart": {}}}))
+            return
+        if kwargs.get("activity_end") is not None:
+            await self._ws_up.send(json.dumps({"realtimeInput": {"activityEnd": {}}}))
+            return
+
+        if audio is not None:
+            if isinstance(audio, dict):
+                data = audio.get("data")
+                mime_type = audio.get("mime_type") or audio.get("mimeType") or PCM_MIME_TYPE
+            else:
+                data = None
+                mime_type = PCM_MIME_TYPE
+
+            if not data:
+                return
+
+            b64 = base64.b64encode(data).decode("ascii")
+            payload = {
+                "realtimeInput": {
+                    "audio": {
+                        "data": b64,
+                        "mimeType": str(mime_type),
+                    }
+                }
+            }
+            await self._ws_up.send(json.dumps(payload))
+            return
+
+        if text is not None:
+            payload = {
+                "clientContent": {
+                    "turns": [{"role": "user", "parts": [{"text": str(text)}]}],
+                    "turnComplete": True,
+                }
+            }
+            await self._ws_up.send(json.dumps(payload))
+            return
+
+    def receive(self):
+        """
+        Return an async generator that yields SDK-like event objects for ONE model turn.
+        It ends when the server sends serverContent.turnComplete == true.
+
+        IMPORTANT: Only ONE receive() generator should be active at a time.
+        """
+
+        async def _gen():
+            if not self._setup_done:
+                await self.setup()
+
+            # Ensure only one active turn consumer reads from ws_down
+            async with self._down_lock:
+                while True:
+                    raw = await self._ws_down.recv()
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode("utf-8", errors="replace")
+                    if not isinstance(raw, str):
+                        continue
+
+                    s = raw.strip()
+                    if not s:
+                        continue
+
+                    try:
+                        msg = json.loads(s)
+                    except Exception:
+                        # Some implementations may forward plain text messages; keep for debugging.
+                        yield SimpleNamespace(data=None, mime_type=None, server_content=None, text=s)
+                        continue
+
+                    if not isinstance(msg, dict):
+                        continue
+
+                    # ---- setupComplete / usageMetadata etc: ignore ----
+                    if "setupComplete" in msg:
+                        continue
+                    if "usageMetadata" in msg and "serverContent" not in msg:
+                        continue
+
+                    # ---- serverContent is the main stream ----
+                    sc = msg.get("serverContent")
+                    if isinstance(sc, dict):
+                        # 1) interruption flag (barge-in)
+                        if sc.get("interrupted") is True:
+                            yield SimpleNamespace(
+                                data=None,
+                                mime_type=None,
+                                server_content={"interrupted": True},
+                                text=None,
+                            )
+
+                        # 2) input/output transcription messages (camelCase -> snake_case)
+                        it = sc.get("inputTranscription")
+                        if isinstance(it, dict) and it.get("text"):
+                            yield SimpleNamespace(
+                                data=None,
+                                mime_type=None,
+                                server_content={"input_transcription": {"text": it.get("text")}},
+                                text=None,
+                            )
+
+                        ot = sc.get("outputTranscription")
+                        if isinstance(ot, dict) and ot.get("text"):
+                            yield SimpleNamespace(
+                                data=None,
+                                mime_type=None,
+                                server_content={"output_transcription": {"text": ot.get("text")}},
+                                text=None,
+                            )
+
+                        # 3) modelTurn parts (audio chunks / text)
+                        model_turn = sc.get("modelTurn")
+                        if isinstance(model_turn, dict):
+                            parts = model_turn.get("parts") or []
+                            if isinstance(parts, list):
+                                for part in parts:
+                                    if not isinstance(part, dict):
+                                        continue
+
+                                    # Audio comes as inlineData Blob: { inlineData: { mimeType, data(base64) } }
+                                    inline = part.get("inlineData")
+                                    if isinstance(inline, dict) and inline.get("data"):
+                                        try:
+                                            pcm = base64.b64decode(inline["data"])
+                                        except Exception:
+                                            pcm = b""
+                                        if pcm:
+                                            yield SimpleNamespace(
+                                                data=pcm,
+                                                mime_type=inline.get("mimeType"),
+                                                server_content=None,
+                                                text=None,
+                                            )
+                                        continue
+
+                                    # Text parts (rare in audio-only) -> forward as server_content
+                                    if part.get("text"):
+                                        yield SimpleNamespace(
+                                            data=None,
+                                            mime_type=None,
+                                            server_content={"model_turn": {"parts": [{"text": part.get("text")}]}}
+                                            ,
+                                            text=None,
+                                        )
+
+                        # 4) turn complete -> end generator (ONE TURN)
+                        if sc.get("turnComplete") is True:
+                            return
+
+                    # Other message types (toolCall, goAway, etc) can be added later.
+
+        return _gen()
+
+    async def close(self):
+        for w in (self._ws_up, self._ws_down):
+            try:
+                await w.close()
+            except Exception:
+                pass
+
+
 
 
 # ——————————————————————————————————————————
@@ -138,22 +464,24 @@ class RosAudioBridge:
                     )
 
                 def _enqueue(self, payload: bytes):
-                    """Push a PCM payload into the asyncio queue (thread-safe)."""
-                    if self._stop_evt.is_set():
+                    if self._stop_evt.is_set() or self._loop.is_closed():
                         return
 
-                    async def _put():
-                        await self._queue.put(payload)
+                    def _cb():
+                        try:
+                            self._queue.put_nowait(payload)
+                        except asyncio.QueueFull:
+                            # drop oldest to keep latency low
+                            try:
+                                self._queue.get_nowait()
+                            except Exception:
+                                pass
+                            try:
+                                self._queue.put_nowait(payload)
+                            except Exception:
+                                pass
 
-                    # If loop is gone, just drop gracefully.
-                    if self._loop.is_closed():
-                        return
-                    try:
-                        fut = asyncio.run_coroutine_threadsafe(_put(), self._loop)
-                        fut.result(timeout=0.25)
-                    except Exception:
-                        # If the loop is busy, drop late chunks rather than blocking.
-                        pass
+                    self._loop.call_soon_threadsafe(_cb)
 
                 def _cb_int16(self, msg: Int16MultiArray):
                     try:
@@ -238,7 +566,8 @@ class GeminiAudioLoop:
         # Event loop reference (used by stop() to close session)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self.proxy_ws_url = os.getenv("GEMINI_PROXY_WS_URL", "").strip()
-        self._proxy_ws = None
+        self._proxy_ws_up = None
+        self._proxy_ws_down = None
 
     @property
     def is_listening(self) -> bool:
@@ -270,7 +599,7 @@ class GeminiAudioLoop:
         """
         Signal the loop to stop and join the thread.
         - Sets the stop flag.
-        - Tries to close the live session (from this thread) via run_coroutine_threadsafe.
+        - Closes the live session + proxy websockets (thread-safe).
         - Joins the worker thread (best-effort) so Start can run cleanly after.
         """
         if not self._is_listening:
@@ -278,6 +607,7 @@ class GeminiAudioLoop:
             return
 
         self._stop_event.set()
+
         # Wake chat worker so it can exit
         try:
             self._chat_queue.put_nowait(None)  # sentinel
@@ -296,37 +626,38 @@ class GeminiAudioLoop:
         self._last_pib_message_id = ""
         self._current_role = None
 
-        # Try to close the live session from here (async -> thread-safe)
-        if self._loop and self.session is not None:
-            try:
-
-                async def _close():
+        # Close async resources from the event loop thread (best-effort)
+        if self._loop:
+            async def _close_async():
+                # Close Gemini live session
+                if self.session is not None:
                     try:
                         await self.session.close()
                     except Exception:
                         pass
 
-                asyncio.run_coroutine_threadsafe(_close(), self._loop)
+                # Close proxy sockets (2-socket mode)
+                for w in (getattr(self, "_proxy_ws_up", None), getattr(self, "_proxy_ws_down", None)):
+                    if w is None:
+                        continue
+                    try:
+                        await w.close()
+                    except Exception:
+                        pass
+
+            try:
+                asyncio.run_coroutine_threadsafe(_close_async(), self._loop)
             except Exception:
                 pass
-            if self._loop and self._proxy_ws is not None:
+        else:
+            # If loop already went away, attempt best-effort closes
+            for w in (getattr(self, "_proxy_ws_up", None), getattr(self, "_proxy_ws_down", None)):
+                if w is None:
+                    continue
                 try:
-
-                    async def _close_ws():
-                        try:
-                            await self._proxy_ws.close()
-                        except Exception:
-                            pass
-
-                    asyncio.run_coroutine_threadsafe(_close_ws(), self._loop)
+                    asyncio.run(w.close())
                 except Exception:
                     pass
-        # If loop already went away, ensure proxy ws closes best-effort
-        elif self._proxy_ws is not None:
-            try:
-                asyncio.run(self._proxy_ws.close())
-            except Exception:
-                pass
 
         if self._thread:
             self._thread.join(timeout=join_timeout)
@@ -615,61 +946,6 @@ class GeminiAudioLoop:
         except Exception:
             logger.exception("send_realtime error")
 
-    async def _proxy_sender(self, ws):
-        """Forward PCM chunks from out_queue to the proxy websocket."""
-        try:
-            while not self._stop_event.is_set():
-                pcm = await self.out_queue.get()
-                if pcm:
-                    await ws.send(pcm)
-        except asyncio.CancelledError:
-            logger.debug("_proxy_sender: cancelled")
-            raise
-        except websockets.exceptions.ConnectionClosed as e:
-            logger.info("Proxy websocket closed (%s).", e.code)
-            self._stop_event.set()
-        except Exception:
-            logger.exception("_proxy_sender error")
-            self._stop_event.set()
-
-    async def _proxy_receiver(self, ws):
-        """Handle messages from the proxy websocket and feed audio + text locally."""
-        try:
-            assistant_text_piece: Optional[str] = None
-            while not self._stop_event.is_set():
-                msg = await ws.recv()
-                if isinstance(msg, bytes):
-                    # Binary frames are audio
-                    resp_like = SimpleNamespace(data=msg, server_content=None, text=None)
-                    assistant_text_piece = self._process_gemini_resp(
-                        resp_like, assistant_text_piece
-                    )
-                    continue
-
-                payload = {}
-                try:
-                    payload = json.loads(msg)
-                except Exception:
-                    logger.debug("proxy_receiver: non-JSON message ignored")
-                    continue
-
-                server_content = payload.get("server_content")
-                if server_content is None:
-                    logger.debug("proxy_receiver: JSON without server_content ignored")
-                    continue
-
-                resp_like = SimpleNamespace(data=None, text=None, server_content=server_content)
-                assistant_text_piece = self._process_gemini_resp(resp_like, assistant_text_piece)
-        except asyncio.CancelledError:
-            logger.debug("_proxy_receiver: cancelled")
-            raise
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("Proxy websocket closed.")
-            self._stop_event.set()
-        except Exception:
-            logger.exception("_proxy_receiver error")
-            self._stop_event.set()
-
     def _log_user_transcriptions(self, sc):
         """
         Called for each server_content event from Gemini:
@@ -701,7 +977,8 @@ class GeminiAudioLoop:
                 force_flush=False,
             )
         else:
-            logger.info("User transcript missing or empty in server_content: %s", sc)
+            pass
+            # logger.warning("User transcript missing or empty in server_content: %s", sc)
 
     def _extract_assistant_text(self, sc) -> Optional[str]:
         """
@@ -747,15 +1024,29 @@ class GeminiAudioLoop:
             sc = resp.get("server_content")
 
         if sc is not None:
+            # Barge-in / interruption: server signals to stop and clear playback queue.
+            interrupted = None
+            if isinstance(sc, dict):
+                interrupted = sc.get("interrupted")
+            else:
+                interrupted = getattr(sc, "interrupted", None)
+            if interrupted:
+                try:
+                    self._drain_queue(self.audio_in_queue)
+                except Exception:
+                    pass
+                assistant_text_piece = None
+
             # User text is sent immediately
             self._log_user_transcriptions(sc)
             # Assistant text is buffered
             new_piece = self._extract_assistant_text(sc)
             if new_piece:
                 assistant_text_piece = new_piece
-                logger.debug(f"Buffered for upcoming audio: {assistant_text_piece}")
+                #logger.debug(f"Buffered for upcoming audio: {assistant_text_piece}")
             else:
-                logger.info("No assistant transcription text present in server_content: %s", sc)
+                pass
+                #logger.info("No assistant transcription text present in server_content: %s", sc)
 
         # Audio
         data = getattr(resp, "data", None)
@@ -865,15 +1156,20 @@ class GeminiAudioLoop:
     async def run(self):
         """
         Main async entry:
-        - If GEMINI_PROXY_WS_URL is set, route traffic via websocket proxy
-        - Otherwise, connect directly to Gemini live session
-        - Starts ROS bridge + 3 tasks (listen/send/receive/play)
-        - Waits for first exception to shut down everything together
+        - If GEMINI_PROXY_WS_URL is set, route traffic via websocket proxy (2-socket mode).
+        - Otherwise, connect directly to Gemini live session.
+        - Starts ROS bridge + tasks (send/receive/play).
+        - Waits for first exception to shut down everything together.
         """
-        client = genai.Client(api_key=self.api_key) if not self.proxy_ws_url else None
+        logger.error(f"proxy {self.proxy_ws_url}")
+
+        # Direct-mode client (only used when proxy is not set)
+        api_key = (self.api_key or os.getenv("GOOGLE_API_KEY", "")).strip()
+        client = genai.Client(api_key=api_key) if api_key else None
+
         ros_started = False
         tasks: list[asyncio.Task] = []
-        ws = None
+
         try:
             # Read chat personality/description from PIB to seed the model
             successful, personality = voice_assistant_client.get_personality_from_chat(
@@ -881,6 +1177,7 @@ class GeminiAudioLoop:
             )
             if not successful:
                 logger.error(f"no personality found for id {self._chat_id}")
+
             description = (
                 personality.description
                 if personality and personality.description is not None
@@ -892,7 +1189,7 @@ class GeminiAudioLoop:
 
             # Init shared queues and logging locks
             self.audio_in_queue = asyncio.Queue[tuple[bytes, Optional[str]]]()
-            self.out_queue = asyncio.Queue(maxsize=5)
+            self.out_queue = asyncio.Queue(maxsize=10)
             self._log_lock = asyncio.Lock()
             await self._ensure_log_dirs()
 
@@ -907,27 +1204,35 @@ class GeminiAudioLoop:
 
             # Branch: proxy or direct
             if self.proxy_ws_url:
-                logger.info("Using Gemini proxy websocket at %s", self.proxy_ws_url)
-                ws = await websockets.connect(self.proxy_ws_url)
-                self._proxy_ws = ws
-                await ws.send(
-                    json.dumps(
-                        {
-                            "model": MODEL,
-                            "config": gemini_config,
-                            "audio_mime_type": PCM_MIME_TYPE,
-                        }
-                    )
-                )
+                base = self.proxy_ws_url.rstrip("/")
+                sid = secrets.token_urlsafe(12)
+
+                # New proxy expects sid in query string; no hello JSON.
+                up_url = f"{base}/up?sid={sid}"
+                down_url = f"{base}/down?sid={sid}"
+
+                ws_up = await websockets.connect(up_url)
+                ws_down = await websockets.connect(down_url)
+
+                self._proxy_ws_up = ws_up
+                self._proxy_ws_down = ws_down
+
+                # Adapter speaks the official Live WS JSON envelope.
+                self.session = ProxyLiveSession(ws_up, ws_down, model=MODEL, config=gemini_config)
+                await self.session.setup()
 
                 tasks = [
                     asyncio.create_task(self._listen_from_ros()),
-                    asyncio.create_task(self._proxy_sender(ws)),
-                    asyncio.create_task(self._proxy_receiver(ws)),
-                    asyncio.create_task(self.play_audio()),
+                    asyncio.create_task(self.send_realtime()),   # unchanged
+                    asyncio.create_task(self.receive_audio()),   # unchanged
+                    asyncio.create_task(self.play_audio()),      # unchanged
                 ]
                 await self._wait_for_tasks(tasks)
+
             else:
+                if client is None:
+                    raise RuntimeError("GOOGLE_API_KEY missing for direct Gemini mode")
+
                 async with client.aio.live.connect(
                     model=MODEL, config=gemini_config
                 ) as session:
@@ -977,20 +1282,41 @@ class GeminiAudioLoop:
             except Exception:
                 pass
 
-            if ws:
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
-            self._proxy_ws = None
+            # Close proxy sockets if open
+            try:
+                if getattr(self, "_proxy_ws_up", None):
+                    await self._proxy_ws_up.close()
+            except Exception:
+                pass
+            try:
+                if getattr(self, "_proxy_ws_down", None):
+                    await self._proxy_ws_down.close()
+            except Exception:
+                pass
+            self._proxy_ws_up = None
+            self._proxy_ws_down = None
 
             logger.info("GeminiAudioLoop.run: terminated")
 
 
 def main():
     # Optional local entry for quick manual test (not used in ROS launch)
+    chat_id = os.getenv("CHAT_ID", "").strip()
+    if not chat_id:
+        logger.error("CHAT_ID env var is required for standalone run(). Exiting.")
+        return
+
     loop = GeminiAudioLoop(api_key=os.getenv("GOOGLE_API_KEY", ""))
-    loop.start()
+    loop.start(chat_id)
+
+    # Keep process alive while the loop thread is running
+    try:
+        while loop.is_listening:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.stop()
 
 
 if __name__ == "__main__":
