@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from pib_api_client import bricklet_client
 from pib_motors.config import cfg
 
-from pib_motors.bricklet_pin import BrickletPin  # <-- your STS-based class
+from pib_motors.bricklet_pin import BrickletPin, _is_robstride_pin
 
 TINKERFORGE_HOST = "localhost"
 TINKERFORGE_PORT = 4223
@@ -37,6 +37,9 @@ for dto in bricklet_dtos["bricklets"]:
 uid_to_servo_bricklet: dict[str, BrickletPin] = {}
 for uid in servo_bricklet_uids:
     try:
+        if _is_robstride_pin(1, uid):
+            logging.info(f"Skipping RobStride port during STS initialization: {uid}")
+            continue
         # uid is your STS device path (e.g. "/dev/ttyUSB0")
         uid_to_servo_bricklet[uid] = BrickletPin(pin=1, uid=uid, invert=False)
         logging.info(f"Initialized STS motor on {uid}")

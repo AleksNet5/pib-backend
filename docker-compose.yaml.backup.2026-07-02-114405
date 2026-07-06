@@ -84,15 +84,6 @@ services:
       - PIB_BLOCKLY_SERVER_URL=http://pib-blockly-server:2442
       - TINKERFORGE_HOST=host.docker.internal
       - TINKERFORGE_PORT=4223
-      - ROBSTRIDE_PORTS=/dev/ttyMotor4
-      - ROBSTRIDE_MOTOR_IDS=21,41
-      - ROBSTRIDE_MODEL=rs-04
-      - ROBSTRIDE_DEFAULT_SPEED=0.06
-      - ROBSTRIDE_DEFAULT_ACCEL=0.15
-      - ROBSTRIDE_DISABLE_AFTER_MOVE=true
-      - ROBSTRIDE_SETTLE_SECONDS=0.75
-      - ROBSTRIDE_DISABLE_WAIT_FACTOR=2.0
-      - ROBSTRIDE_MIN_DISABLE_SECONDS=2.0
     restart: always
     depends_on:
       - rosbridge-ws
@@ -101,8 +92,7 @@ services:
       - "/dev/ttyMotor0:/dev/ttyMotor0"
       - "/dev/ttyMotor1:/dev/ttyMotor1"
       - "/dev/ttyMotor2:/dev/ttyMotor2"
-      - "/dev/ttyMotor3:/dev/ttyMotor3"
-      - "/dev/ttyMotor4:/dev/ttyMotor4"
+      - "/dev/ttyMotor3:/dev/ttyMotor3"       
       
   ros-voice-assistant:
     image: ros_voice_assistant
@@ -176,6 +166,7 @@ services:
       context: .
       dockerfile: ./ros_packages/display/Dockerfile
     profiles:
+      - all
       - display
     volumes:
       # this is a socket that is used by the x-windowing-system
@@ -188,7 +179,7 @@ services:
       - STATIC_IMAGE_DIR=/app/ros2_ws/display/static_images
       - DISPLAY=:0.0
     command: ros2 launch display launch.py
-    restart: no
+    restart: always
     networks:
       - pib-network
 
@@ -229,3 +220,4 @@ volumes:
 networks:
   pib-network:
     driver: bridge
+
