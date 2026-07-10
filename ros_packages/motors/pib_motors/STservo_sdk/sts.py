@@ -66,6 +66,25 @@ class sts(protocol_packet_handler):
         txpacket = [acc, self.sts_lobyte(position), self.sts_hibyte(position), 0, 0, self.sts_lobyte(speed), self.sts_hibyte(speed)]
         return self.writeTxRx(sts_id, STS_ACC, len(txpacket), txpacket)
 
+    def CalibrationOfs(self, sts_id, center_position=2000):
+        sts_present_position, sts_comm_result, sts_error = self.ReadPos(sts_id)
+        if sts_comm_result != COMM_SUCCESS:
+            return sts_comm_result, sts_error
+
+        offset = center_position - sts_present_position
+        offset = max(-2047, min(2047, offset))
+        encoded_offset = self.sts_toscs(offset, 15)
+
+        result, error = self.unLockEprom(sts_id)
+        if result != COMM_SUCCESS:
+            return result, error
+
+        result, error = self.write2ByteTxRx(sts_id, STS_OFS_L, encoded_offset)
+        lock_result, lock_error = self.LockEprom(sts_id)
+        if result != COMM_SUCCESS:
+            return result, error
+        return lock_result, lock_error
+
     def ReadPos(self, sts_id):
         sts_present_position, sts_comm_result, sts_error = self.read2ByteTxRx(sts_id, STS_PRESENT_POSITION_L)
         return self.sts_tohost(sts_present_position, 15), sts_comm_result, sts_error
@@ -112,4 +131,3 @@ class sts(protocol_packet_handler):
 
     def unLockEprom(self, sts_id):
         return self.write1ByteTxRx(sts_id, STS_LOCK, 0)
-

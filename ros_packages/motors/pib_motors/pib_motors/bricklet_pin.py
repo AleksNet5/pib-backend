@@ -69,7 +69,19 @@ def _deg_to_ticks(deg: float) -> int:
     return max(1000, min(3000, ticks))
 
 def _ticks_to_deg(ticks: int) -> float:
-    return float(ticks * 18000 / 4096) - 9000
+    if ticks < 2000:
+        return ((float(ticks) - 1000.0) * (9000.0 / 1000.0)) - 9000.0
+    return (float(ticks) - 2000.0) * (9000.0 / 1050.0)
+
+def _deg_to_tick_delta(deg: float) -> int:
+    if deg < 0:
+        return int(round(deg * (1000.0 / 9000.0)))
+    return int(round(deg * (1050.0 / 9000.0)))
+
+def _tick_delta_to_deg(ticks: int) -> float:
+    if ticks < 0:
+        return float(ticks) * (9000.0 / 1000.0)
+    return float(ticks) * (9000.0 / 1050.0)
 
 
 class _STSBrickletPin:
@@ -114,6 +126,7 @@ class _STSBrickletPin:
         # Lazily opened/cached
         self._ph: PortHandler | None = None
         self._pk: any | None = None
+        self._zero_tick: int = 2000
 
         # Attempt initial check/open
         self.check_connection()
@@ -185,6 +198,23 @@ class _STSBrickletPin:
             return sts_present_current*10
         except Exception:
             return _STSBrickletPin.NO_CURRENT
+
+    def reset_zero_position(self) -> bool:
+        if not self.is_connected():
+            return False
+
+        try:
+            ticks, _speed, res, err = self._pk.ReadPosSpeed(self.pin)
+            if res != COMM_SUCCESS:
+                logging.error(f"STS zero read failed (res={res}, err={err})")
+                return False
+            self._zero_tick = int(ticks)
+            logging.info(f"Set STS software zero for {self} to tick {self._zero_tick}")
+            return True
+        except Exception as error:
+            logging.error(f"Exception during STS zero position reset: {error}")
+            return False
+
     # -------------
     # Position I/O
     # -------------
@@ -200,7 +230,8 @@ class _STSBrickletPin:
         if self.invert:
             deg *= -1.0
 
-        ticks = _deg_to_ticks(deg)
+        ticks = self._zero_tick + _deg_to_tick_delta(deg)
+        ticks = max(0, min(4095, ticks))
         speed = int(self._settings.get("velocity", _DEFAULT_SPEED))
         acc = int(self._settings.get("acceleration", _DEFAULT_ACCEL))
         '''
@@ -247,7 +278,7 @@ class _STSBrickletPin:
             ticks, _spd, res, _err = self._pk.ReadPosSpeed(self.pin)
             if res != COMM_SUCCESS:
                 return 0
-            deg = _ticks_to_deg(int(ticks))
+            deg = _tick_delta_to_deg(int(ticks) - self._zero_tick)
             return int(round(deg))
         except Exception:
             return 0
@@ -495,6 +526,10 @@ class _RobstrideBrickletPin:
 
     def get_current(self) -> int:
         return _RobstrideBrickletPin.NO_CURRENT
+
+    def reset_zero_position(self) -> bool:
+        logging.warning(f"Zero position reset is not supported for {self}")
+        return False
 
     def _motion_speed(self) -> float:
         default = float(os.getenv("ROBSTRIDE_DEFAULT_SPEED", "0.06"))

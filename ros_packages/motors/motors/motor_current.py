@@ -1,8 +1,18 @@
+import os
+
 import rclpy
 from rclpy.node import Node
 from diagnostic_msgs.msg import DiagnosticStatus
 from diagnostic_msgs.msg import KeyValue
-from pib_motors.motor import motors, Motor
+
+
+def _current_polling_enabled() -> bool:
+    return os.getenv("PIB_MOTOR_CURRENT_ENABLED", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class MotorCurrent(Node):
@@ -11,6 +21,10 @@ class MotorCurrent(Node):
 
         super().__init__("motor_current")
 
+        self.enabled = _current_polling_enabled()
+        self.motors = []
+        self.motor_class = None
+
         self.declare_parameter("frequency", 4.0)
         self.frequency_ = self.get_parameter("frequency").value
 
@@ -18,17 +32,28 @@ class MotorCurrent(Node):
             DiagnosticStatus, "motor_current", 10
         )
 
-        self.timer = self.create_timer(
-            1.0 / self.frequency_, self.publish_motor_current
-        )
+        if self.enabled:
+            from pib_motors.motor import motors, Motor
+
+            self.motors = motors
+            self.motor_class = Motor
+            self.timer = self.create_timer(
+                1.0 / self.frequency_, self.publish_motor_current
+            )
+        else:
+            self.timer = None
+            self.get_logger().info("Motor current polling disabled")
 
         self.get_logger().info("Now Running MOTOR CURRENT")
 
     def publish_motor_current(self):
 
-        for motor in motors:
+        if not self.enabled or self.motor_class is None:
+            return
+
+        for motor in self.motors:
             current = motor.get_current()
-            if current == Motor.NO_CURRENT:
+            if current == self.motor_class.NO_CURRENT:
                 continue
             self.publish_diagnostic_status(motor.name, current)
 

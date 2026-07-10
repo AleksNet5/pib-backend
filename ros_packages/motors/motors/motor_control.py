@@ -2,12 +2,28 @@ from typing import Iterable, Tuple
 
 import rclpy
 from datatypes.msg import MotorSettings
-from datatypes.srv import ApplyMotorSettings, ApplyJointTrajectory
+from datatypes.srv import ApplyMotorSettings, ApplyJointTrajectory, ResetMotorZero
 from pib_api_client import motor_client
 from pib_motors.bricklet import connected_enumerate
 from pib_motors.motor import name_to_motors, motors
 from rclpy.node import Node
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+
+HAND_MOTOR_NAMES = {
+    "thumb_left_opposition",
+    "thumb_left_stretch",
+    "index_left_stretch",
+    "middle_left_stretch",
+    "ring_left_stretch",
+    "pinky_left_stretch",
+    "thumb_right_opposition",
+    "thumb_right_stretch",
+    "index_right_stretch",
+    "middle_right_stretch",
+    "ring_right_stretch",
+    "pinky_right_stretch",
+}
 
 
 def motor_settings_ros_to_dto(ms: MotorSettings):
@@ -70,6 +86,10 @@ class MotorControl(Node):
             ApplyMotorSettings, "apply_motor_settings", self.apply_motor_settings
         )
 
+        self.reset_zero_srv = self.create_service(
+            ResetMotorZero, "reset_motor_zero", self.reset_motor_zero
+        )
+
         # Publisher for MotorSettings
         self.motor_settings_publisher = self.create_publisher(
             MotorSettings, "motor_settings", 10
@@ -78,12 +98,11 @@ class MotorControl(Node):
         # load motor-settings if not in dev mode
         if not self.dev:
             for motor in motors:
-                if motor.check_if_motor_is_connected():
-                    successful, motor_settings_dto = motor_client.get_motor_settings(
-                        motor.name
-                    )
-                    if successful:
-                        motor.apply_settings(motor_settings_dto)
+                successful, motor_settings_dto = motor_client.get_motor_settings(
+                    motor.name
+                )
+                if successful:
+                    motor.load_settings(motor_settings_dto)
 
         # Log that initialization is complete
         self.get_logger().info("Now Running MOTOR_CONTROL")
@@ -122,6 +141,40 @@ class MotorControl(Node):
                 f"Error while processing motor-settings-message: {str(e)}"
             )
 
+        return response
+
+    def reset_motor_zero(
+        self,
+        request: ResetMotorZero.Request,
+        response: ResetMotorZero.Response,
+    ) -> ResetMotorZero.Response:
+        motor_name = request.motor_name
+        if motor_name not in HAND_MOTOR_NAMES:
+            response.successful = False
+            response.message = f"zero reset is only allowed for hand motors: {motor_name}"
+            self.get_logger().warn(response.message)
+            return response
+
+        try:
+            response.successful = all(
+                motor.reset_zero_position() for motor in name_to_motors[motor_name]
+            )
+            response.message = (
+                "zero position reset succeeded"
+                if response.successful
+                else "zero position reset failed"
+            )
+            if response.successful:
+                self.joint_trajectory_publisher.publish(
+                    as_joint_trajectory(motor_name, 0)
+                )
+        except Exception as error:
+            response.successful = False
+            response.message = str(error)
+
+        self.get_logger().info(
+            f"reset zero position of {motor_name}: {response.message}"
+        )
         return response
 
     def apply_joint_trajectory(

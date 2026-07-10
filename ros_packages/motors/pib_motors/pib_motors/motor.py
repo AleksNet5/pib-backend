@@ -1,6 +1,14 @@
+import logging
+import os
+import time
 from typing import Any
+
 from pib_motors.bricklet_pin import BrickletPin
 from pib_api_client import motor_client
+
+
+API_RETRY_TIMEOUT_SECONDS = float(os.getenv("PIB_API_RETRY_TIMEOUT_SECONDS", "60"))
+API_RETRY_INTERVAL_SECONDS = float(os.getenv("PIB_API_RETRY_INTERVAL_SECONDS", "2"))
 
 
 class Motor:
@@ -23,10 +31,7 @@ class Motor:
 
     def apply_settings(self, settings_dto: dict[str, Any]) -> bool:
         """apply provided settings to the motor"""
-        self.visible = settings_dto["visible"]
-        self.invert = settings_dto["invert"]
-        self.rotation_range_min = settings_dto["rotationRangeMin"]
-        self.rotation_range_max = settings_dto["rotationRangeMax"]
+        self.load_settings(settings_dto)
 
         if not self.bricklet_pins:
             return False
@@ -37,6 +42,29 @@ class Motor:
             self.set_position(adjusted_position)
 
         return all(bp.apply_settings(settings_dto) for bp in self.bricklet_pins)
+
+    def load_settings(self, settings_dto: dict[str, Any]) -> None:
+        """Load stored settings without touching hardware."""
+        self.visible = settings_dto["visible"]
+        self.invert = settings_dto["invert"]
+        self.rotation_range_min = settings_dto["rotationRangeMin"]
+        self.rotation_range_max = settings_dto["rotationRangeMax"]
+
+        for bricklet_pin in self.bricklet_pins:
+            settings = getattr(bricklet_pin, "_settings", None)
+            if settings is None:
+                continue
+            for key in (
+                "velocity",
+                "acceleration",
+                "deceleration",
+                "turnedOn",
+                "pulseWidthMin",
+                "pulseWidthMax",
+                "period",
+            ):
+                if key in settings_dto:
+                    settings[key] = settings_dto[key]
 
     def get_settings(self) -> dict[str, Any]:
         """get the current settings of this motor"""
@@ -79,16 +107,47 @@ class Motor:
             bp.is_connected() for bp in self.bricklet_pins
         )
 
+    def reset_zero_position(self) -> bool:
+        """Use the current physical position as this motor's neutral position."""
+        return bool(self.bricklet_pins) and all(
+            bp.reset_zero_position() for bp in self.bricklet_pins
+        )
+
     def _validate_position(self, position: int) -> int:
         """Check if position is within range, set it to the min/max value if not."""
         position = min(max(position, self.rotation_range_min), self.rotation_range_max)
         return position
 
 
+def _load_motors_from_api() -> dict[str, Any]:
+    """Wait for the Flask API during boot and then return the motor payload."""
+    deadline = time.monotonic() + API_RETRY_TIMEOUT_SECONDS
+    attempt = 1
+
+    while True:
+        successful, response = motor_client.get_all_motors()
+        if successful:
+            if attempt > 1:
+                logging.info("Loaded motors from pib-api after %d attempts.", attempt)
+            return response
+
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"failed to load motors from pib-api after {attempt} attempts..."
+            )
+
+        logging.warning(
+            "pib-api is not ready yet; retrying motor load in %.1f seconds "
+            "(attempt %d).",
+            API_RETRY_INTERVAL_SECONDS,
+            attempt,
+        )
+        time.sleep(API_RETRY_INTERVAL_SECONDS)
+        attempt += 1
+
+
 # get data from pib-api
-successful, response = motor_client.get_all_motors()
-if not successful:
-    raise RuntimeError("failed to load motors from pib-api...")
+response = _load_motors_from_api()
 
 # list of all available motor-objects
 motors: list[Motor] = []

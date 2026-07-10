@@ -21,6 +21,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
 	"msg/ProgramInput.msg"
 	"msg/ChatIsListening.msg"
 	"srv/ApplyMotorSettings.srv"
+	"srv/ResetMotorZero.srv"
 	"msg/ImageId.msg"
 	"msg/ImageFormat.msg"
 	"msg/DisplayImage.msg"
