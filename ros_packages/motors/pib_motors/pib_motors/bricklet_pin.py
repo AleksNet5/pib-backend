@@ -230,8 +230,14 @@ class _STSBrickletPin:
         if self.invert:
             deg *= -1.0
 
-        ticks = self._zero_tick + _deg_to_tick_delta(deg)
-        ticks = max(0, min(4095, ticks))
+        raw_ticks = self._zero_tick + _deg_to_tick_delta(deg)
+        ticks = max(0, min(4095, raw_ticks))
+        if ticks != raw_ticks:
+            logging.warning(
+                f"STS target for {self} is outside raw range "
+                f"(zero={self._zero_tick}, position={position}, target={raw_ticks}); "
+                f"clamped to {ticks}"
+            )
         speed = int(self._settings.get("velocity", _DEFAULT_SPEED))
         acc = int(self._settings.get("acceleration", _DEFAULT_ACCEL))
         '''
@@ -324,6 +330,11 @@ class _ATSerialCAN:
         )
         time.sleep(0.10)
         self.serial.reset_input_buffer()
+
+    def clear_pending(self) -> None:
+        self.rx.clear()
+        if self.serial is not None:
+            self.serial.reset_input_buffer()
 
     def send(self, message) -> None:
         if self.serial is None:
@@ -426,6 +437,10 @@ def _create_robstride_bus(port: str, motors: dict[str, object], baudrate: int):
             transport.open()
             self.channel_handler = transport
 
+        def clear_pending(self) -> None:
+            if self.channel_handler is not None:
+                self.channel_handler.clear_pending()
+
     return RobstrideSerialBus(port, motors, baudrate)
 
 
@@ -487,15 +502,125 @@ class _RobstrideBrickletPin:
         self._device = _get_robstride_device(self.uid, self._baudrate, self._model)
         self._motor_name = self._device.register_motor(self.pin)
         self._disable_timer: threading.Timer | None = None
+        self._position_target_primed = False
+        self._keepalive_thread: threading.Thread | None = None
 
     def __str__(self) -> str:
         return f"ROBSTRIDE-PIN[ id: {self.pin}, device: {self.uid} ]"
 
+    def _read_mechanical_position(self, bus, parameter_type) -> float:
+        attempts = max(1, int(os.getenv("ROBSTRIDE_READ_ATTEMPTS", "3")))
+        retry_delay = max(
+            0.0, float(os.getenv("ROBSTRIDE_READ_RETRY_SECONDS", "0.02"))
+        )
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                bus.clear_pending()
+                return float(bus.read(self._motor_name, parameter_type))
+            except Exception as error:
+                last_error = error
+                if attempt < attempts:
+                    time.sleep(retry_delay)
+
+        raise RuntimeError(
+            f"could not read mechanical position after {attempts} attempts"
+        ) from last_error
+
+    def _uses_shortest_path(self) -> bool:
+        motor_ids = {
+            int(value)
+            for value in _csv_env("ROBSTRIDE_SHORTEST_PATH_IDS", "41")
+        }
+        return self.pin in motor_ids
+
+    def _logical_position(self, position: float) -> float:
+        if not self._uses_shortest_path():
+            return position
+        return math.atan2(math.sin(position), math.cos(position))
+
+    def _resolve_position_target(self, start: float, requested: float) -> float:
+        if not self._uses_shortest_path():
+            return requested
+
+        full_turn = 2.0 * math.pi
+        nearest_turn = round((start - requested) / full_turn)
+        return requested + (nearest_turn * full_turn)
+
+    def _configure_can_timeout(self, bus) -> None:
+        timeout = int(os.getenv("ROBSTRIDE_CAN_TIMEOUT", "40000"))
+        if timeout <= 0:
+            return
+        timeout = min(timeout, 100000)
+        timeout_parameter = _robstride_parameter("CAN_TIMEOUT")
+        attempts = max(1, int(os.getenv("ROBSTRIDE_READ_ATTEMPTS", "3")))
+        retry_delay = max(
+            0.0, float(os.getenv("ROBSTRIDE_READ_RETRY_SECONDS", "0.02"))
+        )
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                bus.clear_pending()
+                bus.write(self._motor_name, timeout_parameter, timeout)
+                return
+            except Exception as error:
+                last_error = error
+                if attempt < attempts:
+                    time.sleep(retry_delay)
+
+        raise RuntimeError(
+            f"could not configure CAN timeout after {attempts} attempts"
+        ) from last_error
+
+    def _start_keepalive(self) -> None:
+        if int(os.getenv("ROBSTRIDE_CAN_TIMEOUT", "40000")) <= 0:
+            return
+        if self._keepalive_thread is not None and self._keepalive_thread.is_alive():
+            return
+
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop,
+            name=f"robstride-keepalive-{self.pin}",
+            daemon=True,
+        )
+        self._keepalive_thread.start()
+
+    def _keepalive_loop(self) -> None:
+        interval = max(
+            0.1, float(os.getenv("ROBSTRIDE_KEEPALIVE_SECONDS", "0.5"))
+        )
+        communication_failed = False
+
+        while True:
+            time.sleep(interval)
+            try:
+                with self._device.lock:
+                    bus = self._device.connect()
+                    _, _, ParameterType, _ = _load_robstride_dependencies()
+                    self._read_mechanical_position(
+                        bus, ParameterType.MECHANICAL_POSITION
+                    )
+                self._connected = True
+                if communication_failed:
+                    logging.info(f"RobStride keepalive recovered for {self}")
+                    communication_failed = False
+            except Exception as error:
+                self._connected = False
+                self._position_target_primed = False
+                if not communication_failed:
+                    logging.warning(f"RobStride keepalive failed for {self}: {error}")
+                    communication_failed = True
+
     def check_connection(self) -> bool:
         try:
-            bus = self._device.connect()
-            _, _, ParameterType, _ = _load_robstride_dependencies()
-            bus.read(self._motor_name, ParameterType.MECHANICAL_POSITION)
+            with self._device.lock:
+                bus = self._device.connect()
+                _, _, ParameterType, _ = _load_robstride_dependencies()
+                self._read_mechanical_position(
+                    bus, ParameterType.MECHANICAL_POSITION
+                )
             self._connected = True
         except Exception as error:
             logging.warning(f"RobStride check failed for {self}: {error}")
@@ -563,7 +688,7 @@ class _RobstrideBrickletPin:
         return max((move_seconds * factor) + settle, minimum)
 
     def _schedule_disable(self, wait_seconds: float) -> None:
-        if not _bool_env("ROBSTRIDE_DISABLE_AFTER_MOVE", "true"):
+        if not _bool_env("ROBSTRIDE_DISABLE_AFTER_MOVE", "false"):
             return
         if self._disable_timer is not None:
             self._disable_timer.cancel()
@@ -587,7 +712,7 @@ class _RobstrideBrickletPin:
         degrees = float(position) / 100.0
         if self.invert:
             degrees *= -1.0
-        target = math.radians(degrees)
+        requested_target = math.radians(degrees)
 
         try:
             with self._device.lock:
@@ -599,23 +724,48 @@ class _RobstrideBrickletPin:
                 position_target = _robstride_parameter("POSITION_TARGET")
                 speed = self._motion_speed()
                 accel = self._motion_acceleration()
+                self._configure_can_timeout(bus)
+                start = self._read_mechanical_position(
+                    bus, ParameterType.MECHANICAL_POSITION
+                )
+                target = self._resolve_position_target(start, requested_target)
+                prime_target = (
+                    _bool_env("ROBSTRIDE_PRIME_POSITION_TARGET", "true")
+                    and not self._position_target_primed
+                )
 
-                try:
-                    start = float(
-                        bus.read(self._motor_name, ParameterType.MECHANICAL_POSITION)
-                    )
-                except Exception:
-                    start = target
+                logging.info(
+                    "RobStride position command for %s: start=%+.4f rad, "
+                    "requested=%+.4f rad, target=%+.4f rad, startup_prime=%s",
+                    self,
+                    start,
+                    requested_target,
+                    target,
+                    prime_target,
+                )
 
                 bus.disable(self._motor_name)
                 bus.write(self._motor_name, mode, 1)
                 bus.write(self._motor_name, velocity, speed)
                 bus.write(self._motor_name, acceleration, accel)
+
+                # Load a no-motion target before enabling PP mode. After a power
+                # cycle, enabling first can briefly activate the controller's
+                # reset/default target and start a move in the wrong direction.
+                if prime_target:
+                    bus.write(self._motor_name, position_target, start)
+
                 bus.enable(self._motor_name)
+                if prime_target:
+                    self._position_target_primed = True
+                    time.sleep(
+                        float(os.getenv("ROBSTRIDE_PRIME_SETTLE_SECONDS", "0.05"))
+                    )
                 bus.write(self._motor_name, position_target, target)
 
             wait_seconds = self._move_timeout(target - start, speed, accel)
             self._schedule_disable(wait_seconds)
+            self._start_keepalive()
             return True
         except Exception as error:
             logging.error(f"Error while setting RobStride position for {self}: {error}")
@@ -626,10 +776,14 @@ class _RobstrideBrickletPin:
         if not self.is_connected():
             return 0
         try:
-            bus = self._device.connect()
-            _, _, ParameterType, _ = _load_robstride_dependencies()
-            radians = bus.read(self._motor_name, ParameterType.MECHANICAL_POSITION)
-            degrees = math.degrees(float(radians))
+            with self._device.lock:
+                bus = self._device.connect()
+                _, _, ParameterType, _ = _load_robstride_dependencies()
+                radians = self._read_mechanical_position(
+                    bus, ParameterType.MECHANICAL_POSITION
+                )
+            radians = self._logical_position(float(radians))
+            degrees = math.degrees(radians)
             if self.invert:
                 degrees *= -1.0
             return int(round(degrees * 100.0))

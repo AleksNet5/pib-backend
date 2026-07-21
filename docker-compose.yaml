@@ -71,6 +71,7 @@ services:
     build:
       context: .
       dockerfile: ./ros_packages/motors/Dockerfile
+    privileged: true
     command: ros2 launch motors launch.py
     profiles:
       - all
@@ -89,20 +90,23 @@ services:
       - ROBSTRIDE_MODEL=rs-04
       - ROBSTRIDE_DEFAULT_SPEED=0.06
       - ROBSTRIDE_DEFAULT_ACCEL=0.15
-      - ROBSTRIDE_DISABLE_AFTER_MOVE=true
+      - ROBSTRIDE_DISABLE_AFTER_MOVE=false
+      - ROBSTRIDE_SHORTEST_PATH_IDS=41
+      - ROBSTRIDE_CAN_TIMEOUT=40000
+      - ROBSTRIDE_KEEPALIVE_SECONDS=0.5
       - ROBSTRIDE_SETTLE_SECONDS=0.75
       - ROBSTRIDE_DISABLE_WAIT_FACTOR=2.0
       - ROBSTRIDE_MIN_DISABLE_SECONDS=2.0
+      - ROBSTRIDE_PRIME_POSITION_TARGET=true
+      - ROBSTRIDE_PRIME_SETTLE_SECONDS=0.05
+      - WAIT_FOR_DEVICES=/dev/ttyMotor0 /dev/ttyMotor1 /dev/ttyMotor2 /dev/ttyMotor3 /dev/ttyMotor4
+      - WAIT_FOR_DEVICES_TIMEOUT=30
     restart: always
     depends_on:
       - rosbridge-ws
       - flask-app
-    devices:
-      - "/dev/ttyMotor0:/dev/ttyMotor0"
-      - "/dev/ttyMotor1:/dev/ttyMotor1"
-      - "/dev/ttyMotor2:/dev/ttyMotor2"
-      - "/dev/ttyMotor3:/dev/ttyMotor3"
-      - "/dev/ttyMotor4:/dev/ttyMotor4"
+    volumes:
+      - /dev/:/dev/
       
   ros-voice-assistant:
     image: ros_voice_assistant
