@@ -1,0 +1,15 @@
+[Unit]
+Description=Move pib to its startup and poweroff pose
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=pib
+Group=pib
+ExecStart=/home/pib/app/pib-backend/setup/run-startup-poweroff-pose.sh
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

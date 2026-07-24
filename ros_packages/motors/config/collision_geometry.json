@@ -1,0 +1,99 @@
+{
+    "version": 1,
+    "coordinate_system": {
+        "unit": "mm",
+        "origin": "pib Webots base at floor centre",
+        "x": "left/right",
+        "y": "front/back",
+        "z": "height"
+    },
+    "enclosure": {
+        "name": "Safety enclosure",
+        "clear_size_mm": [1800, 1000, 1200],
+        "clear_center_mm": [0, -375, 600],
+        "rear_wall_y_mm": 125,
+        "wall_thickness_mm": 50,
+        "safety_margin_mm": 30
+    },
+    "obstacles": [
+        {
+            "name": "Volume 4",
+            "type": "box",
+            "rotation_rpy_deg": [0, 89, 0],
+            "safety_margin_mm": 30,
+            "ignored_links": [
+                "shoulder_vertical_left",
+                "shoulder_horizontal_left",
+                "shoulder_vertical_right",
+                "shoulder_horizontal_right",
+                "upper_arm_right_rotation"
+            ],
+            "center_mm": [-10, -27, 669],
+            "size_mm": [1000, 200, 280]
+        },
+        {
+            "name": "Volume 5",
+            "type": "box",
+            "rotation_rpy_deg": [0, 0, 0],
+            "safety_margin_mm": 30,
+            "center_mm": [0, -52, 331],
+            "size_mm": [2000, 2000, 260]
+        },
+        {
+            "name": "Volume 6",
+            "type": "box",
+            "rotation_rpy_deg": [0, 0, 0],
+            "safety_margin_mm": 30,
+            "center_mm": [-17, -325, 476],
+            "size_mm": [200, 300, 2000]
+        },
+        {
+            "name": "Enclosure left wall",
+            "type": "box",
+            "rotation_rpy_deg": [0, 0, 0],
+            "safety_margin_mm": 30,
+            "center_mm": [925, -375, 600],
+            "size_mm": [50, 1000, 1200]
+        },
+        {
+            "name": "Enclosure right wall",
+            "type": "box",
+            "rotation_rpy_deg": [0, 0, 0],
+            "safety_margin_mm": 30,
+            "center_mm": [-925, -375, 600],
+            "size_mm": [50, 1000, 1200]
+        },
+        {
+            "name": "Enclosure rear wall",
+            "type": "box",
+            "rotation_rpy_deg": [0, 0, 0],
+            "safety_margin_mm": 30,
+            "center_mm": [0, 150, 600],
+            "size_mm": [1800, 50, 1200]
+        },
+        {
+            "name": "Enclosure front wall",
+            "type": "box",
+            "rotation_rpy_deg": [0, 0, 0],
+            "safety_margin_mm": 30,
+            "center_mm": [0, -900, 600],
+            "size_mm": [1800, 50, 1200]
+        },
+        {
+            "name": "Enclosure floor",
+            "type": "box",
+            "rotation_rpy_deg": [0, 0, 0],
+            "safety_margin_mm": 30,
+            "center_mm": [0, -375, -25],
+            "size_mm": [1800, 1000, 50]
+        },
+        {
+            "name": "Enclosure ceiling",
+            "type": "box",
+            "rotation_rpy_deg": [0, 0, 0],
+            "safety_margin_mm": 30,
+            "center_mm": [0, -375, 1225],
+            "size_mm": [1800, 1000, 50]
+        }
+    ]
+}

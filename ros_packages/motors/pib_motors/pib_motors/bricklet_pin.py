@@ -18,9 +18,16 @@ _TICKS_PER_DEG = 11.378
 _DEFAULT_BAUD = 1_000_000
 _DEFAULT_SPEED = 1000
 _DEFAULT_ACCEL = 50
+_STS_COMMAND_ATTEMPTS = max(1, int(os.getenv("STS_COMMAND_ATTEMPTS", "3")))
+_STS_RETRY_SECONDS = max(0.0, float(os.getenv("STS_RETRY_SECONDS", "0.05")))
+_STS_PORT_REOPEN_COOLDOWN_SECONDS = max(
+    0.0, float(os.getenv("STS_PORT_REOPEN_COOLDOWN_SECONDS", "1.0"))
+)
 
 # Cache one serial port + packet handler per device so multiple motors on the same bus reuse it
 _port_cache: Dict[str, Tuple[PortHandler, any]] = {}
+_port_last_reopen: Dict[str, float] = {}
+_port_reopen_lock = threading.Lock()
 _robstride_bus_cache: Dict[str, "_RobstrideDevice"] = {}
 
 
@@ -127,6 +134,11 @@ class _STSBrickletPin:
         self._ph: PortHandler | None = None
         self._pk: any | None = None
         self._zero_tick: int = 2000
+        self._last_position: int = 0
+        self._last_comm_result: int = COMM_SUCCESS
+        self._last_servo_error: int = 0
+        self._last_comm_exception: str | None = None
+        self._failed_transactions: int = 0
 
         # Attempt initial check/open
         self.check_connection()
@@ -137,15 +149,109 @@ class _STSBrickletPin:
     # ----------------
     # Connection state
     # ----------------
+    def _record_comm_failure(
+        self,
+        result: int,
+        error: int = 0,
+        exception: Exception | None = None,
+    ) -> None:
+        self._last_comm_result = result
+        self._last_servo_error = error
+        self._last_comm_exception = str(exception) if exception is not None else None
+        self._failed_transactions += 1
+        self._connected = False
+
+    def _record_comm_success(self) -> None:
+        if self._failed_transactions:
+            logging.info(
+                f"STS communication recovered for {self} after "
+                f"{self._failed_transactions} failed transaction(s)"
+            )
+        self._last_comm_result = COMM_SUCCESS
+        self._last_servo_error = 0
+        self._last_comm_exception = None
+        self._failed_transactions = 0
+        self._connected = True
+
+    def _last_failure_description(self) -> str:
+        result_text = ""
+        servo_error_text = ""
+        if self._pk is not None:
+            try:
+                result_text = self._pk.getTxRxResult(self._last_comm_result)
+            except Exception:
+                pass
+            try:
+                servo_error_text = self._pk.getRxPacketError(
+                    self._last_servo_error
+                )
+            except Exception:
+                pass
+
+        details = f"res={self._last_comm_result}"
+        if result_text:
+            details += f" ({result_text})"
+        details += f", err={self._last_servo_error}"
+        if servo_error_text:
+            details += f" ({servo_error_text})"
+        if self._last_comm_exception:
+            details += f", exception={self._last_comm_exception}"
+        return details
+
+    def _prepare_sts_retry(self, failed_attempt: int) -> None:
+        if self._ph is None:
+            return
+
+        serial_port = getattr(self._ph, "ser", None)
+        if serial_port is not None:
+            try:
+                serial_port.reset_input_buffer()
+            except Exception:
+                pass
+
+        if failed_attempt < 2:
+            return
+
+        reopen = getattr(self._ph, "setBaudRate", None)
+        if not callable(reopen):
+            return
+
+        now = time.monotonic()
+        with _port_reopen_lock:
+            last_reopen = _port_last_reopen.get(self.uid, 0.0)
+            if now - last_reopen < _STS_PORT_REOPEN_COOLDOWN_SECONDS:
+                return
+            _port_last_reopen[self.uid] = now
+
+        try:
+            self._ph.is_using = False
+            if reopen(self._baudrate):
+                logging.warning(
+                    f"Reopened STS serial port {self.uid} after repeated "
+                    f"communication failure"
+                )
+            else:
+                logging.error(
+                    f"Failed to reopen STS serial port {self.uid} at "
+                    f"{self._baudrate} baud"
+                )
+        except Exception as error:
+            logging.error(f"Exception while reopening STS port {self.uid}: {error}")
+
     def check_connection(self) -> bool:
         """Check we can talk to the STS bus and read this ID once."""
         try:
             self._ph, self._pk = _get_or_open_port(self.uid, self._baudrate)
             # Probe by reading pos/speed for this ID
-            _, _, res, _err = self._pk.ReadPosSpeed(self.pin)
-            self._connected = (res == COMM_SUCCESS)
-        except Exception:
-            self._connected = False
+            ticks, _, result, error = self._pk.ReadPosSpeed(self.pin)
+            if result == COMM_SUCCESS:
+                degrees = _tick_delta_to_deg(int(ticks) - self._zero_tick)
+                self._last_position = int(round(degrees))
+                self._record_comm_success()
+            else:
+                self._record_comm_failure(result, error)
+        except Exception as error:
+            self._record_comm_failure(COMM_TX_FAIL, exception=error)
         return bool(self._connected)
 
     def is_connected(self) -> bool:
@@ -175,7 +281,8 @@ class _STSBrickletPin:
                 if key in settings_dto:
                     self._settings[key] = settings_dto[key]
 
-            # Nothing to actively send until a position command (STS sets speed/acc there)
+            if "turnedOn" in settings_dto:
+                return self._set_torque_enabled(bool(settings_dto["turnedOn"]))
             return True
         except Exception as error:
             logging.error(f"Error while applying STS motor settings: {error}")
@@ -209,6 +316,7 @@ class _STSBrickletPin:
                 logging.error(f"STS zero read failed (res={res}, err={err})")
                 return False
             self._zero_tick = int(ticks)
+            self._last_position = 0
             logging.info(f"Set STS software zero for {self} to tick {self._zero_tick}")
             return True
         except Exception as error:
@@ -218,14 +326,53 @@ class _STSBrickletPin:
     # -------------
     # Position I/O
     # -------------
+    def _set_torque_enabled(self, enabled: bool) -> bool:
+        if self._pk is None and not self.check_connection():
+            return False
+        result, error = self._pk.write1ByteTxRx(
+            self.pin, STS_TORQUE_ENABLE, int(enabled)
+        )
+        if result != COMM_SUCCESS:
+            logging.warning(
+                f"STS torque {'enable' if enabled else 'disable'} failed for {self} "
+                f"(res={result}, err={error})"
+            )
+            self._record_comm_failure(result, error)
+            return False
+        self._last_comm_result = COMM_SUCCESS
+        self._last_servo_error = 0
+        self._last_comm_exception = None
+        self._connected = True
+        return True
+
+    def _log_failure_diagnostics(self) -> None:
+        if self._pk is None:
+            return
+
+        values = {}
+        for name, address in (
+            ("torque", STS_TORQUE_ENABLE),
+            ("voltage", STS_PRESENT_VOLTAGE),
+            ("temperature", STS_PRESENT_TEMPERATURE),
+        ):
+            value, result, _error = self._pk.read1ByteTxRx(self.pin, address)
+            if result == COMM_SUCCESS:
+                values[name] = value
+
+        if values:
+            voltage = values.get("voltage")
+            if voltage is not None:
+                values["voltage_v"] = voltage / 10.0
+                del values["voltage"]
+            logging.error(f"STS diagnostics after command failure for {self}: {values}")
+        else:
+            logging.error(f"STS diagnostics unavailable for {self}; servo is not replying")
+
     def set_position(self, position: int) -> bool:
         """
         Set target position in DEGREES (kept consistent with your examples).
         If your upstream publishes a different unit, adjust mapping here.
         """
-        if not self.is_connected():
-            return False
-
         deg = float(position)
         if self.invert:
             deg *= -1.0
@@ -257,37 +404,83 @@ class _STSBrickletPin:
             return False
         return True
         '''
-        try:
-            STS3095_pins = [41, 40, 50, 51, 18, 38, 20, 21, 39, 19]
-            if self.pin in STS3095_pins:
-                res, err = self._pk.WritePosEx(self.pin, ticks, 700, 30)
-            else:
-                res, err = self._pk.WritePosEx(self.pin, ticks, 3000, 100)
-
-            if res != COMM_SUCCESS:
-                logging.error(f"STS WritePosEx failed (res={res}, err={err})")
-                return False
-
-        except Exception as e:
-            logging.error(f"Exception during WritePosEx: {e}")
+        if not bool(self._settings.get("turnedOn", True)):
+            logging.warning(f"Ignoring position command while STS torque is disabled for {self}")
             return False
 
-        return True
+        STS3095_pins = [41, 40, 50, 51, 18, 38, 20, 21, 39, 19]
+        if self.pin in STS3095_pins:
+            speed, acc = 700, 30
+        else:
+            speed, acc = 3000, 100
+
+        last_result = COMM_TX_FAIL
+        last_error = 0
+        for attempt in range(1, _STS_COMMAND_ATTEMPTS + 1):
+            try:
+                if self._connected is not True and not self.check_connection():
+                    last_result = self._last_comm_result
+                    last_error = self._last_servo_error
+                elif not self._set_torque_enabled(True):
+                    last_result = self._last_comm_result
+                    last_error = self._last_servo_error
+                else:
+                    last_result, last_error = self._pk.WritePosEx(
+                        self.pin, ticks, speed, acc
+                    )
+                    if last_result == COMM_SUCCESS:
+                        self._record_comm_success()
+                        return True
+                    self._record_comm_failure(last_result, last_error)
+            except Exception as error:
+                logging.warning(
+                    f"STS position attempt {attempt}/{_STS_COMMAND_ATTEMPTS} "
+                    f"raised for {self}: {error}"
+                )
+                self._record_comm_failure(COMM_TX_FAIL, exception=error)
+
+            if attempt < _STS_COMMAND_ATTEMPTS:
+                self._prepare_sts_retry(attempt)
+                time.sleep(_STS_RETRY_SECONDS)
+
+        logging.error(
+            f"STS WritePosEx failed for {self} after {_STS_COMMAND_ATTEMPTS} attempts "
+            f"({self._last_failure_description()})"
+        )
+        self._log_failure_diagnostics()
+        return False
     
     def get_position(self) -> int:
         """
         Read current position in DEGREES (rounded to int for API parity).
         """
-        if not self.is_connected():
-            return 0
-        try:
-            ticks, _spd, res, _err = self._pk.ReadPosSpeed(self.pin)
-            if res != COMM_SUCCESS:
-                return 0
-            deg = _tick_delta_to_deg(int(ticks) - self._zero_tick)
-            return int(round(deg))
-        except Exception:
-            return 0
+        for attempt in range(1, _STS_COMMAND_ATTEMPTS + 1):
+            try:
+                if self._connected is not True:
+                    if self.check_connection():
+                        return self._last_position
+                else:
+                    ticks, _spd, result, error = self._pk.ReadPosSpeed(self.pin)
+                    if result == COMM_SUCCESS:
+                        degrees = _tick_delta_to_deg(
+                            int(ticks) - self._zero_tick
+                        )
+                        self._last_position = int(round(degrees))
+                        self._record_comm_success()
+                        return self._last_position
+                    self._record_comm_failure(result, error)
+            except Exception as error:
+                self._record_comm_failure(COMM_TX_FAIL, exception=error)
+
+            if attempt < _STS_COMMAND_ATTEMPTS:
+                self._prepare_sts_retry(attempt)
+                time.sleep(_STS_RETRY_SECONDS)
+
+        logging.warning(
+            f"STS position read failed for {self}; using last valid position "
+            f"{self._last_position} ({self._last_failure_description()})"
+        )
+        return self._last_position
 
 
 def _load_robstride_dependencies():
