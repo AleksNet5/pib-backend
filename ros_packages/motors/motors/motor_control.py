@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Iterable, Tuple
 
 import rclpy
@@ -11,7 +12,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from motors.collision_guard import CollisionGuard, all_arm_names
+from motors.collision_guard import ARM_MOTOR_NAMES, CollisionGuard, all_arm_names
 
 
 HAND_MOTOR_NAMES = {
@@ -28,6 +29,18 @@ HAND_MOTOR_NAMES = {
     "ring_right_stretch",
     "pinky_right_stretch",
 }
+
+
+def bool_env(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def csv_env(name: str, default: str) -> set[str]:
+    return {
+        value.strip()
+        for value in os.getenv(name, default).split(",")
+        if value.strip()
+    }
 
 
 def motor_settings_ros_to_dto(ms: MotorSettings):
@@ -71,6 +84,18 @@ def as_arm_pose(positions: dict[str, float]) -> JointTrajectory:
     point = JointTrajectoryPoint()
     point.positions = [positions[name] for name in jt.joint_names]
     jt.points = [point]
+    return jt
+
+
+def as_motor_trajectory(
+    motor_positions: Iterable[Tuple[str, float]],
+) -> JointTrajectory:
+    jt = JointTrajectory()
+    for motor_name, position in motor_positions:
+        jt.joint_names.append(motor_name)
+        point = JointTrajectoryPoint()
+        point.positions.append(float(position))
+        jt.points.append(point)
     return jt
 
 
@@ -120,7 +145,6 @@ class MotorControl(Node):
             self._publish_collision_joint_limits,
             10,
         )
-
         # Service for MotorSettings
         self.srv = self.create_service(
             ApplyMotorSettings, "apply_motor_settings", self.apply_motor_settings
@@ -144,12 +168,79 @@ class MotorControl(Node):
                 if successful:
                     motor.load_settings(motor_settings_dto)
 
+        self.sts_recovery_timer = None
+        self.sts_recovery_pins = []
+        self.sts_recovery_pin_groups = {}
+        self.sts_recovery_group_indices = {}
+        self.sts_recovery_sweeps = {}
+        self.pending_arm_targets = {
+            side: {} for side in ARM_MOTOR_NAMES
+        }
+        self._retrying_pending_arm_targets = False
+        self.arm_position_feedback_missing = set()
+        self.sts_multi_motor_stagger_seconds = max(
+            0.0,
+            float(os.getenv("STS_MULTI_MOTOR_STAGGER_SECONDS", "0")),
+        )
+        if bool_env("STS_RECOVERY_ENABLED", "false"):
+            recovery_ports = csv_env(
+                "STS_RECOVERY_PORTS",
+                "/dev/ttyMotor2,/dev/ttyMotor3",
+            )
+            recovery_motor_names = csv_env(
+                "STS_RECOVERY_MOTOR_NAMES",
+                (
+                    "thumb_left_opposition,thumb_left_stretch,"
+                    "index_left_stretch,middle_left_stretch,"
+                    "ring_left_stretch,pinky_left_stretch,wrist_left,"
+                    "lower_arm_left_rotation,elbow_left,"
+                    "upper_arm_left_rotation,shoulder_horizontal_left"
+                ),
+            )
+            self.sts_recovery_pins = [
+                (motor.name, bricklet_pin)
+                for motor in motors
+                for bricklet_pin in motor.bricklet_pins
+                if motor.name in recovery_motor_names
+                and bricklet_pin.uid in recovery_ports
+                and callable(
+                    getattr(bricklet_pin, "maintain_connection", None)
+                )
+            ]
+            for motor_name, bricklet_pin in self.sts_recovery_pins:
+                self.sts_recovery_pin_groups.setdefault(
+                    bricklet_pin.uid, []
+                ).append((motor_name, bricklet_pin))
+            self.sts_recovery_group_indices = {
+                uid: 0 for uid in self.sts_recovery_pin_groups
+            }
+            self.sts_recovery_sweeps = {
+                uid: {"checked": 0, "received_reply": False}
+                for uid in self.sts_recovery_pin_groups
+            }
+            recovery_interval = max(
+                0.1,
+                float(os.getenv("STS_RECOVERY_INTERVAL_SECONDS", "1.0")),
+            )
+            self.sts_recovery_timer = self.create_timer(
+                recovery_interval,
+                self._maintain_sts_connections,
+            )
+            self.get_logger().info(
+                f"STS recovery watchdog started for "
+                f"{len(self.sts_recovery_pins)} configured left-side motors on "
+                f"{sorted(recovery_ports)}; checking one motor per bus every "
+                f"{recovery_interval:.1f} seconds"
+            )
+
         self.collision_guard_mode = os.getenv(
             "COLLISION_GUARD_MODE", "off"
         ).lower()
         self.collision_guard = self._create_collision_guard()
         self.arm_positions = (
-            self._read_arm_positions() if self.collision_guard is not None else {}
+            self._read_arm_positions(probe_missing=True)
+            if self.collision_guard is not None
+            else {}
         )
         self.collision_arm_positions_timer = self.create_timer(
             1.0, self._publish_collision_arm_positions
@@ -158,6 +249,30 @@ class MotorControl(Node):
 
         # Log that initialization is complete
         self.get_logger().info("Now Running MOTOR_CONTROL")
+
+    def _maintain_sts_connections(self) -> None:
+        for uid, pins in self.sts_recovery_pin_groups.items():
+            index = self.sts_recovery_group_indices[uid] % len(pins)
+            self.sts_recovery_group_indices[uid] = index + 1
+            motor_name, bricklet_pin = pins[index]
+            try:
+                bricklet_pin.maintain_connection()
+                received_reply = bool(
+                    bricklet_pin.last_maintenance_received_reply()
+                )
+                sweep = self.sts_recovery_sweeps[uid]
+                sweep["checked"] += 1
+                sweep["received_reply"] |= received_reply
+                if sweep["checked"] >= len(pins):
+                    if not sweep["received_reply"]:
+                        bricklet_pin.reopen_shared_bus()
+                    sweep["checked"] = 0
+                    sweep["received_reply"] = False
+            except Exception as error:
+                self.get_logger().error(
+                    f"unexpected STS recovery error for {motor_name}: {error}"
+                )
+        self._retry_pending_arm_targets()
 
     def _create_collision_guard(self):
         if self.collision_guard_mode == "off":
@@ -189,16 +304,133 @@ class MotorControl(Node):
         )
         return guard
 
-    def _read_arm_positions(self) -> dict[str, float]:
-        positions = {}
+    def _read_arm_positions(
+        self, probe_missing: bool = False
+    ) -> dict[str, float]:
+        positions = dict(getattr(self, "arm_positions", {}))
+        missing = set()
         for motor_name in all_arm_names():
             motor = name_to_motors[motor_name][0]
+            if not probe_missing and not motor.has_valid_position():
+                missing.add(motor_name)
+                continue
             position = motor.get_position()
+            if not motor.has_valid_position():
+                missing.add(motor_name)
+                continue
             if motor.invert:
                 position *= -1
             positions[motor_name] = float(position)
+        self.arm_position_feedback_missing = missing
         self.get_logger().info(f"Collision guard arm positions: {positions}")
+        if missing:
+            self.get_logger().warn(
+                "Collision guard has no real position feedback for: "
+                f"{sorted(missing)}"
+            )
         return positions
+
+    def _missing_feedback_for_side(self, side: str) -> set[str]:
+        return {
+            motor_name
+            for motor_name in ARM_MOTOR_NAMES[side]
+            if not name_to_motors[motor_name][0].has_valid_position()
+        }
+
+    def _defer_targets_without_feedback(
+        self,
+        motor_positions: list[Tuple[str, float]],
+    ) -> tuple[list[Tuple[str, float]], bool]:
+        available = list(motor_positions)
+        deferred = False
+        target_names = {name for name, _position in motor_positions}
+
+        for side, arm_names in ARM_MOTOR_NAMES.items():
+            if not target_names.intersection(arm_names):
+                continue
+            missing = self._missing_feedback_for_side(side)
+            if not missing:
+                continue
+
+            deferred = True
+            side_names = set(arm_names)
+            for motor_name, position in motor_positions:
+                if motor_name in side_names:
+                    self.pending_arm_targets[side][motor_name] = position
+            available = [
+                pair for pair in available if pair[0] not in side_names
+            ]
+            self.get_logger().warn(
+                f"Deferred {side} arm target until real feedback returns; "
+                f"missing: {sorted(missing)}"
+            )
+
+        return available, deferred
+
+    def _retry_pending_arm_targets(self) -> None:
+        if self._retrying_pending_arm_targets:
+            return
+
+        ready = []
+        for side, targets in self.pending_arm_targets.items():
+            if targets and not self._missing_feedback_for_side(side):
+                ready.append((side, list(targets.items())))
+        if not ready:
+            return
+
+        self._retrying_pending_arm_targets = True
+        try:
+            for side, targets in ready:
+                self.pending_arm_targets[side].clear()
+                request = ApplyJointTrajectory.Request()
+                request.joint_trajectory = as_motor_trajectory(targets)
+                response = ApplyJointTrajectory.Response()
+                response = self.apply_joint_trajectory(request, response)
+                self.get_logger().info(
+                    f"Retried deferred {side} arm target after feedback "
+                    f"returned: {'accepted' if response.successful else 'failed'}"
+                )
+        finally:
+            self._retrying_pending_arm_targets = False
+
+    def _pace_multi_motor_sts_command(
+        self,
+        motor_name: str,
+        motor,
+        last_command_at: dict[str, float],
+    ) -> set[str]:
+        if (
+            self.sts_multi_motor_stagger_seconds <= 0
+            or motor_name not in all_arm_names()
+        ):
+            return set()
+
+        bus_uids = {
+            bricklet_pin.uid
+            for bricklet_pin in motor.bricklet_pins
+            if callable(getattr(bricklet_pin, "maintain_connection", None))
+        }
+        if not bus_uids:
+            return set()
+
+        now = time.monotonic()
+        wait_seconds = max(
+            (
+                last_command_at[uid]
+                + self.sts_multi_motor_stagger_seconds
+                - now
+                for uid in bus_uids
+                if uid in last_command_at
+            ),
+            default=0.0,
+        )
+        if wait_seconds > 0:
+            self.get_logger().info(
+                f"Pacing multi-joint STS command for {motor_name} by "
+                f"{wait_seconds:.2f} seconds"
+            )
+            time.sleep(wait_seconds)
+        return bus_uids
 
     def _publish_collision_arm_positions(self) -> None:
         if self.arm_positions:
@@ -327,12 +559,22 @@ class MotorControl(Node):
     ) -> ApplyJointTrajectory.Response:
         jt = request.joint_trajectory
         motor_positions = list(as_motor_positions(jt))
+        is_multi_motor_request = len(motor_positions) > 1
+        last_sts_command_at: dict[str, float] = {}
         response.successful = True
         try:
             if self.collision_guard is not None:
                 targets = dict(motor_positions)
                 if any(name in all_arm_names() for name in targets):
                     self.arm_positions = self._read_arm_positions()
+                    motor_positions, deferred = (
+                        self._defer_targets_without_feedback(motor_positions)
+                    )
+                    if deferred:
+                        response.successful = False
+                    if not motor_positions:
+                        return response
+                    targets = dict(motor_positions)
                 collision_result = self.collision_guard.evaluate(
                     self.arm_positions, targets
                 )
@@ -369,10 +611,22 @@ class MotorControl(Node):
 
             for motor_name, position in motor_positions:
                 for motor in name_to_motors[motor_name]:
+                    bus_uids = (
+                        self._pace_multi_motor_sts_command(
+                            motor_name,
+                            motor,
+                            last_sts_command_at,
+                        )
+                        if is_multi_motor_request
+                        else set()
+                    )
                     self.get_logger().info(
                         f"setting position of {motor.name} to {position}"
                     )
                     successful = motor.set_position(position)
+                    command_time = time.monotonic()
+                    for uid in bus_uids:
+                        last_sts_command_at[uid] = command_time
                     self.get_logger().info(
                         f"setting position {'succeeded' if successful else 'failed'}."
                     )

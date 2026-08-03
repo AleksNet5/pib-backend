@@ -1,0 +1,2 @@
+pib ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff, /usr/bin/systemctl reboot
+pib-power ALL=(pib) NOPASSWD: /home/pib/app/pib-backend/setup/pib-poweroff.sh, /home/pib/app/pib-backend/setup/pib-reboot.sh, /home/pib/app/pib-backend/setup/run-startup-poweroff-pose.sh --dry-run

@@ -1,0 +1,22 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+POWER_OFF_SCRIPT="/home/pib/app/pib-backend/setup/pib-poweroff.sh"
+REBOOT_SCRIPT="/home/pib/app/pib-backend/setup/pib-reboot.sh"
+POSE_SCRIPT="/home/pib/app/pib-backend/setup/run-startup-poweroff-pose.sh"
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+    poweroff | "$POWER_OFF_SCRIPT" | "sudo $POWER_OFF_SCRIPT")
+        exec sudo -n -u pib "$POWER_OFF_SCRIPT"
+        ;;
+    reboot | "$REBOOT_SCRIPT" | "sudo $REBOOT_SCRIPT")
+        exec sudo -n -u pib "$REBOOT_SCRIPT"
+        ;;
+    check)
+        exec sudo -n -u pib "$POSE_SCRIPT" --dry-run
+        ;;
+    *)
+        echo "Allowed commands: poweroff, reboot, check" >&2
+        exit 2
+        ;;
+esac

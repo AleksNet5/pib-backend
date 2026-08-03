@@ -60,6 +60,18 @@ services:
       - ROBSTRIDE_MIN_DISABLE_SECONDS=2.0
       - ROBSTRIDE_PRIME_POSITION_TARGET=true
       - ROBSTRIDE_PRIME_SETTLE_SECONDS=0.05
+      - STS_RECOVERY_ENABLED=true
+      - STS_RECOVERY_PORTS=/dev/ttyMotor2,/dev/ttyMotor3
+      - STS_RECOVERY_MOTOR_NAMES=thumb_left_opposition,thumb_left_stretch,index_left_stretch,middle_left_stretch,ring_left_stretch,pinky_left_stretch,wrist_left,lower_arm_left_rotation,elbow_left,upper_arm_left_rotation,shoulder_horizontal_left
+      - STS_RECOVERY_INTERVAL_SECONDS=2.0
+      - STS_RECOVERY_FAILURE_THRESHOLD=2
+      - STS_PORT_AUTO_REOPEN_ENABLED=false
+      - STS_BUS_REOPEN_COOLDOWN_SECONDS=30.0
+      - STS_BUS_REOPEN_DELAY_SECONDS=0.5
+      - STS_MULTI_MOTOR_STAGGER_SECONDS=0.75
+      - STS_RECOVERY_RETRY_SECONDS=2.0
+      - STS_RECOVERY_MAX_ATTEMPTS=3
+      - STS_RECOVERY_WINDOW_SECONDS=60.0
       - COLLISION_GUARD_MODE=enforce
       - COLLISION_TRAJECTORY_STEP_DEGREES=0.25
       - COLLISION_RANGE_STEP_DEGREES=1.0
@@ -73,6 +85,8 @@ services:
       - /dev/:/dev/
       - ./ros_packages/motors/motors/collision_guard.py:/app/ros2_ws/install/motors/lib/python3.10/site-packages/motors/collision_guard.py:ro
       - ./ros_packages/motors/motors/motor_control.py:/app/ros2_ws/install/motors/lib/python3.10/site-packages/motors/motor_control.py:ro
+      - ./ros_packages/motors/pib_motors/pib_motors/bricklet_pin.py:/usr/local/lib/python3.10/dist-packages/pib_motors/bricklet_pin.py:ro
+      - ./ros_packages/motors/pib_motors/pib_motors/motor.py:/usr/local/lib/python3.10/dist-packages/pib_motors/motor.py:ro
       - ./ros_packages/motors/config/collision_geometry.json:/app/ros2_ws/motors/config/collision_geometry.json:ro
       - ./setup/system_pose.py:/app/system_pose.py:ro
       

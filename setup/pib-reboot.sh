@@ -13,11 +13,11 @@ case "${1:-}" in
     "")
         ;;
     *)
-        echo "Usage: sudo $0 [--dry-run|--pose-only]" >&2
+        echo "Usage: $0 [--dry-run|--pose-only]" >&2
         exit 2
         ;;
 esac
 
 "${SCRIPT_DIR}/run-startup-poweroff-pose.sh"
 echo "system-pose: rebooting"
-systemctl reboot
+exec sudo -n /usr/bin/systemctl reboot

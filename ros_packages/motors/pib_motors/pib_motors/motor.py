@@ -95,6 +95,13 @@ class Motor:
             return 0
         return self.bricklet_pins[0].get_position()
 
+    def has_valid_position(self) -> bool:
+        """Return whether every physical pin has produced real position feedback."""
+        return bool(self.bricklet_pins) and all(
+            bool(getattr(bp, "has_valid_position", lambda: True)())
+            for bp in self.bricklet_pins
+        )
+
     def get_current(self) -> int:
         """returns the maximum current of all bricklet-pins, or NO_CURRENT, if not bricklet-pin is connected"""
         if not self.bricklet_pins:

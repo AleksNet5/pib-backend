@@ -210,6 +210,32 @@ function move_setup_files() {
   printf '<meta content="0; url=http://localhost:8000" http-equiv=refresh>' > "$HOME/Desktop/pib_data.html"
 }
 
+function install_power_control_sudoers() {
+  local source_file="$BACKEND_DIR/setup/setup_files/pib-power-control.sudoers"
+  local target_file="/etc/sudoers.d/pib-power-control"
+
+  sudo install -o root -g root -m 0440 "$source_file" "$target_file"
+  sudo visudo -cf "$target_file"
+  print SUCCESS "Installed passwordless PIB power-control commands"
+}
+
+function install_passwordless_power_ssh() {
+  local command_source="$BACKEND_DIR/setup/setup_files/pib-power-ssh-command"
+  local command_target="/usr/local/sbin/pib-power-ssh-command"
+  local config_source="$BACKEND_DIR/setup/setup_files/pib-power-ssh.conf"
+  local config_target="/etc/ssh/sshd_config.d/90-pib-power.conf"
+
+  if ! id -u pib-power >/dev/null 2>&1; then
+    sudo useradd --system --create-home --shell /bin/bash pib-power
+  fi
+  sudo passwd --delete pib-power
+  sudo install -o root -g root -m 0755 "$command_source" "$command_target"
+  sudo install -o root -g root -m 0644 "$config_source" "$config_target"
+  sudo sshd -t
+  sudo systemctl reload ssh || sudo systemctl reload sshd
+  print SUCCESS "Installed restricted passwordless PIB power SSH account"
+}
+
 function install_DBbrowser() {
   sudo apt install -y sqlitebrowser
   print SUCCESS "Installed DB browser"
@@ -385,6 +411,10 @@ install_system_packages || { print ERROR "failed to install system packages"; re
 install_locale || { print ERROR "failed to install locale"; return 1; }
 clone_repositories || { print ERROR "failed to clone repositories"; return 1; }
 move_setup_files || print ERROR "failed to move setup files"
+install_power_control_sudoers || {
+  print ERROR "failed to install PIB power-control sudoers rule"
+  return 1
+}
 install_DBbrowser || print ERROR "failed to install DB browser"
 install_tinkerforge || print ERROR "failed to install tinkerforge"
 setup_ip_dispatcher || print ERROR "failed to setup ip dispatcher"
@@ -398,6 +428,10 @@ elif is_ubuntu_noble || is_supported_raspbian; then
   source "$SETUP_INSTALLATION_DIR/docker_install.sh" || print ERROR "failed to install Cerebra via Docker"
   sudo usermod -aG docker pib || { print ERROR "failed to add user 'pib' to docker group"; return 1; }
 fi
+install_passwordless_power_ssh || {
+  print ERROR "failed to install passwordless PIB power SSH account"
+  return 1
+}
 cleanup
 
 print SUCCESS "Finished installation, for more information on how to use pib and Cerebra, visit https://pib-rocks.atlassian.net/wiki/spaces/kb/overview?homepageId=65077450"

@@ -3,6 +3,7 @@ import math
 import os
 import threading
 import time
+from collections import deque
 from typing import Any, Dict, Tuple
 
 import serial
@@ -23,10 +24,33 @@ _STS_RETRY_SECONDS = max(0.0, float(os.getenv("STS_RETRY_SECONDS", "0.05")))
 _STS_PORT_REOPEN_COOLDOWN_SECONDS = max(
     0.0, float(os.getenv("STS_PORT_REOPEN_COOLDOWN_SECONDS", "1.0"))
 )
+_STS_BUS_REOPEN_COOLDOWN_SECONDS = max(
+    1.0, float(os.getenv("STS_BUS_REOPEN_COOLDOWN_SECONDS", "30.0"))
+)
+_STS_BUS_REOPEN_DELAY_SECONDS = max(
+    0.0, float(os.getenv("STS_BUS_REOPEN_DELAY_SECONDS", "0.5"))
+)
+_STS_PORT_AUTO_REOPEN_ENABLED = os.getenv(
+    "STS_PORT_AUTO_REOPEN_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes", "on")
+_STS_RECOVERY_FAILURE_THRESHOLD = max(
+    1, int(os.getenv("STS_RECOVERY_FAILURE_THRESHOLD", "2"))
+)
+_STS_RECOVERY_RETRY_SECONDS = max(
+    0.0, float(os.getenv("STS_RECOVERY_RETRY_SECONDS", "2.0"))
+)
+_STS_RECOVERY_MAX_ATTEMPTS = max(
+    1, int(os.getenv("STS_RECOVERY_MAX_ATTEMPTS", "3"))
+)
+_STS_RECOVERY_WINDOW_SECONDS = max(
+    1.0, float(os.getenv("STS_RECOVERY_WINDOW_SECONDS", "60.0"))
+)
+_STS_SLOW_IDS = {18, 19, 20, 21, 38, 39, 40, 41, 50, 51}
 
 # Cache one serial port + packet handler per device so multiple motors on the same bus reuse it
 _port_cache: Dict[str, Tuple[PortHandler, any]] = {}
 _port_last_reopen: Dict[str, float] = {}
+_bus_last_reopen: Dict[str, float] = {}
 _port_reopen_lock = threading.Lock()
 _robstride_bus_cache: Dict[str, "_RobstrideDevice"] = {}
 
@@ -135,10 +159,18 @@ class _STSBrickletPin:
         self._pk: any | None = None
         self._zero_tick: int = 2000
         self._last_position: int = 0
+        self._has_valid_position: bool = False
         self._last_comm_result: int = COMM_SUCCESS
         self._last_servo_error: int = 0
         self._last_comm_exception: str | None = None
         self._failed_transactions: int = 0
+        self._last_target_ticks: int | None = None
+        self._has_commanded_position: bool = False
+        self._restore_required: bool = False
+        self._last_recovery_attempt: float = 0.0
+        self._recovery_attempts: deque[float] = deque()
+        self._recovery_throttled_logged: bool = False
+        self._last_maintenance_received_reply: bool = False
 
         # Attempt initial check/open
         self.check_connection()
@@ -160,6 +192,9 @@ class _STSBrickletPin:
         self._last_comm_exception = str(exception) if exception is not None else None
         self._failed_transactions += 1
         self._connected = False
+        self._has_valid_position = False
+        if self._failed_transactions >= _STS_RECOVERY_FAILURE_THRESHOLD:
+            self._restore_required = True
 
     def _record_comm_success(self) -> None:
         if self._failed_transactions:
@@ -172,6 +207,18 @@ class _STSBrickletPin:
         self._last_comm_exception = None
         self._failed_transactions = 0
         self._connected = True
+
+    def _record_position(self, ticks: int) -> None:
+        self._last_position = int(
+            round(_tick_delta_to_deg(int(ticks) - self._zero_tick))
+        )
+        self._has_valid_position = True
+
+    def has_valid_position(self) -> bool:
+        return self._has_valid_position
+
+    def last_maintenance_received_reply(self) -> bool:
+        return self._last_maintenance_received_reply
 
     def _last_failure_description(self) -> str:
         result_text = ""
@@ -212,6 +259,9 @@ class _STSBrickletPin:
         if failed_attempt < 2:
             return
 
+        if not _STS_PORT_AUTO_REOPEN_ENABLED:
+            return
+
         reopen = getattr(self._ph, "setBaudRate", None)
         if not callable(reopen):
             return
@@ -238,6 +288,45 @@ class _STSBrickletPin:
         except Exception as error:
             logging.error(f"Exception while reopening STS port {self.uid}: {error}")
 
+    def reopen_shared_bus(self) -> bool:
+        """Reopen one shared serial port after every configured ID stops replying."""
+        if self._ph is None:
+            return False
+
+        now = time.monotonic()
+        with _port_reopen_lock:
+            last_reopen = _bus_last_reopen.get(self.uid, 0.0)
+            if now - last_reopen < _STS_BUS_REOPEN_COOLDOWN_SECONDS:
+                return False
+            _bus_last_reopen[self.uid] = now
+
+            try:
+                self._ph.is_using = False
+                close_port = getattr(self._ph, "closePort", None)
+                if callable(close_port) and bool(
+                    getattr(self._ph, "is_open", False)
+                ):
+                    close_port()
+                if _STS_BUS_REOPEN_DELAY_SECONDS:
+                    time.sleep(_STS_BUS_REOPEN_DELAY_SECONDS)
+                if not self._ph.setBaudRate(self._baudrate):
+                    logging.error(
+                        f"Failed to reopen unresponsive STS bus {self.uid} at "
+                        f"{self._baudrate} baud"
+                    )
+                    return False
+                logging.warning(
+                    f"Reopened unresponsive STS bus {self.uid} after a full "
+                    "watchdog sweep received no replies"
+                )
+                return True
+            except Exception as error:
+                logging.error(
+                    f"Exception while reopening unresponsive STS bus "
+                    f"{self.uid}: {error}"
+                )
+                return False
+
     def check_connection(self) -> bool:
         """Check we can talk to the STS bus and read this ID once."""
         try:
@@ -245,8 +334,9 @@ class _STSBrickletPin:
             # Probe by reading pos/speed for this ID
             ticks, _, result, error = self._pk.ReadPosSpeed(self.pin)
             if result == COMM_SUCCESS:
-                degrees = _tick_delta_to_deg(int(ticks) - self._zero_tick)
-                self._last_position = int(round(degrees))
+                if self._last_target_ticks is None:
+                    self._last_target_ticks = int(ticks)
+                self._record_position(ticks)
                 self._record_comm_success()
             else:
                 self._record_comm_failure(result, error)
@@ -317,6 +407,9 @@ class _STSBrickletPin:
                 return False
             self._zero_tick = int(ticks)
             self._last_position = 0
+            self._has_valid_position = True
+            self._last_target_ticks = int(ticks)
+            self._restore_required = False
             logging.info(f"Set STS software zero for {self} to tick {self._zero_tick}")
             return True
         except Exception as error:
@@ -368,6 +461,133 @@ class _STSBrickletPin:
         else:
             logging.error(f"STS diagnostics unavailable for {self}; servo is not replying")
 
+    def _motion_profile(self) -> tuple[int, int]:
+        if self.pin in _STS_SLOW_IDS:
+            return 700, 30
+        return 3000, 100
+
+    def _begin_recovery_attempt(self) -> bool:
+        now = time.monotonic()
+        while (
+            self._recovery_attempts
+            and now - self._recovery_attempts[0] > _STS_RECOVERY_WINDOW_SECONDS
+        ):
+            self._recovery_attempts.popleft()
+
+        if now - self._last_recovery_attempt < _STS_RECOVERY_RETRY_SECONDS:
+            return False
+
+        if len(self._recovery_attempts) >= _STS_RECOVERY_MAX_ATTEMPTS:
+            if not self._recovery_throttled_logged:
+                logging.error(
+                    f"STS automatic recovery throttled for {self} after "
+                    f"{len(self._recovery_attempts)} attempts in "
+                    f"{_STS_RECOVERY_WINDOW_SECONDS:.0f} seconds"
+                )
+                self._recovery_throttled_logged = True
+            return False
+
+        self._last_recovery_attempt = now
+        self._recovery_attempts.append(now)
+        self._recovery_throttled_logged = False
+        return True
+
+    def maintain_connection(self) -> bool:
+        """Probe an enabled STS servo and restore its last successful target."""
+        self._last_maintenance_received_reply = False
+        if not bool(self._settings.get("turnedOn", True)):
+            # An intentionally disabled servo is not evidence that its bus failed.
+            self._last_maintenance_received_reply = True
+            return True
+
+        if self._pk is None:
+            self.check_connection()
+            if self._pk is None:
+                return False
+
+        try:
+            ticks, _speed, result, error = self._pk.ReadPosSpeed(self.pin)
+        except Exception as exception:
+            self._record_comm_failure(COMM_TX_FAIL, exception=exception)
+            self._prepare_sts_retry(self._failed_transactions)
+            return False
+
+        if result != COMM_SUCCESS:
+            self._record_comm_failure(result, error)
+            self._prepare_sts_retry(self._failed_transactions)
+            return False
+
+        ticks = int(ticks)
+        self._last_maintenance_received_reply = True
+        if self._last_target_ticks is None:
+            self._last_target_ticks = ticks
+        self._record_position(ticks)
+
+        try:
+            torque, result, error = self._pk.read1ByteTxRx(
+                self.pin, STS_TORQUE_ENABLE
+            )
+        except Exception as exception:
+            self._record_comm_failure(COMM_TX_FAIL, exception=exception)
+            self._prepare_sts_retry(self._failed_transactions)
+            return False
+
+        if result != COMM_SUCCESS:
+            self._record_comm_failure(result, error)
+            self._prepare_sts_retry(self._failed_transactions)
+            return False
+
+        torque_was_disabled = int(torque) == 0
+        if not self._has_commanded_position:
+            self._record_comm_success()
+            return True
+        if torque_was_disabled:
+            self._restore_required = True
+
+        self._record_comm_success()
+        if not self._restore_required:
+            return True
+        if not self._begin_recovery_attempt():
+            return False
+
+        speed, acceleration = self._motion_profile()
+        target_ticks = self._last_target_ticks
+
+        try:
+            if torque_was_disabled:
+                # Prime the current position before enabling torque so a stale
+                # servo-side target cannot cause a jump.
+                result, error = self._pk.WritePosEx(
+                    self.pin, ticks, speed, acceleration
+                )
+                if result != COMM_SUCCESS:
+                    self._record_comm_failure(result, error)
+                    return False
+
+            if not self._set_torque_enabled(True):
+                return False
+
+            result, error = self._pk.WritePosEx(
+                self.pin, target_ticks, speed, acceleration
+            )
+            if result != COMM_SUCCESS:
+                self._record_comm_failure(result, error)
+                self._log_failure_diagnostics()
+                return False
+        except Exception as exception:
+            self._record_comm_failure(COMM_TX_FAIL, exception=exception)
+            logging.error(f"STS automatic recovery failed for {self}: {exception}")
+            return False
+
+        self._restore_required = False
+        self._record_comm_success()
+        logging.warning(
+            f"STS automatic recovery restored {self} to target tick "
+            f"{target_ticks} after "
+            f"{'torque-off' if torque_was_disabled else 'communication loss'}"
+        )
+        return True
+
     def set_position(self, position: int) -> bool:
         """
         Set target position in DEGREES (kept consistent with your examples).
@@ -408,11 +628,12 @@ class _STSBrickletPin:
             logging.warning(f"Ignoring position command while STS torque is disabled for {self}")
             return False
 
-        STS3095_pins = [41, 40, 50, 51, 18, 38, 20, 21, 39, 19]
-        if self.pin in STS3095_pins:
-            speed, acc = 700, 30
-        else:
-            speed, acc = 3000, 100
+        # Keep the latest requested target even if this command cannot reach
+        # the servo. The recovery loop can finish it when communication returns.
+        self._last_target_ticks = ticks
+        self._has_commanded_position = True
+
+        speed, acc = self._motion_profile()
 
         last_result = COMM_TX_FAIL
         last_error = 0
@@ -429,6 +650,7 @@ class _STSBrickletPin:
                         self.pin, ticks, speed, acc
                     )
                     if last_result == COMM_SUCCESS:
+                        self._restore_required = False
                         self._record_comm_success()
                         return True
                     self._record_comm_failure(last_result, last_error)
@@ -462,10 +684,7 @@ class _STSBrickletPin:
                 else:
                     ticks, _spd, result, error = self._pk.ReadPosSpeed(self.pin)
                     if result == COMM_SUCCESS:
-                        degrees = _tick_delta_to_deg(
-                            int(ticks) - self._zero_tick
-                        )
-                        self._last_position = int(round(degrees))
+                        self._record_position(ticks)
                         self._record_comm_success()
                         return self._last_position
                     self._record_comm_failure(result, error)
@@ -683,6 +902,8 @@ class _RobstrideBrickletPin:
         self._baudrate = int(os.getenv("ROBSTRIDE_BAUD", "921600"))
         self._model = os.getenv("ROBSTRIDE_MODEL", "rs-04")
         self._connected: bool | None = None
+        self._last_position: int = 0
+        self._has_valid_position: bool = False
         self._settings: Dict[str, Any] = {
             "velocity": float(os.getenv("ROBSTRIDE_DEFAULT_SPEED", "0.06")),
             "acceleration": float(os.getenv("ROBSTRIDE_DEFAULT_ACCEL", "0.15")),
@@ -700,6 +921,18 @@ class _RobstrideBrickletPin:
 
     def __str__(self) -> str:
         return f"ROBSTRIDE-PIN[ id: {self.pin}, device: {self.uid} ]"
+
+    def _record_position(self, radians: float) -> int:
+        logical_radians = self._logical_position(float(radians))
+        degrees = math.degrees(logical_radians)
+        if self.invert:
+            degrees *= -1.0
+        self._last_position = int(round(degrees * 100.0))
+        self._has_valid_position = True
+        return self._last_position
+
+    def has_valid_position(self) -> bool:
+        return self._has_valid_position
 
     def _read_mechanical_position(self, bus, parameter_type) -> float:
         attempts = max(1, int(os.getenv("ROBSTRIDE_READ_ATTEMPTS", "3")))
@@ -811,9 +1044,10 @@ class _RobstrideBrickletPin:
             with self._device.lock:
                 bus = self._device.connect()
                 _, _, ParameterType, _ = _load_robstride_dependencies()
-                self._read_mechanical_position(
+                radians = self._read_mechanical_position(
                     bus, ParameterType.MECHANICAL_POSITION
                 )
+            self._record_position(radians)
             self._connected = True
         except Exception as error:
             logging.warning(f"RobStride check failed for {self}: {error}")
@@ -967,7 +1201,7 @@ class _RobstrideBrickletPin:
 
     def get_position(self) -> int:
         if not self.is_connected():
-            return 0
+            return self._last_position
         try:
             with self._device.lock:
                 bus = self._device.connect()
@@ -975,13 +1209,11 @@ class _RobstrideBrickletPin:
                 radians = self._read_mechanical_position(
                     bus, ParameterType.MECHANICAL_POSITION
                 )
-            radians = self._logical_position(float(radians))
-            degrees = math.degrees(radians)
-            if self.invert:
-                degrees *= -1.0
-            return int(round(degrees * 100.0))
+            self._connected = True
+            return self._record_position(radians)
         except Exception:
-            return 0
+            self._connected = False
+            return self._last_position
 
 
 class BrickletPin:
