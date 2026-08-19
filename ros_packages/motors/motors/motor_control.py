@@ -185,7 +185,7 @@ class MotorControl(Node):
         if bool_env("STS_RECOVERY_ENABLED", "false"):
             recovery_ports = csv_env(
                 "STS_RECOVERY_PORTS",
-                "/dev/ttyMotor2,/dev/ttyMotor3",
+                "/dev/ttyMotor1,/dev/ttyMotor2,/dev/ttyMotor3",
             )
             recovery_motor_names = csv_env(
                 "STS_RECOVERY_MOTOR_NAMES",
@@ -194,7 +194,9 @@ class MotorControl(Node):
                     "index_left_stretch,middle_left_stretch,"
                     "ring_left_stretch,pinky_left_stretch,wrist_left,"
                     "lower_arm_left_rotation,elbow_left,"
-                    "upper_arm_left_rotation,shoulder_horizontal_left"
+                    "upper_arm_left_rotation,shoulder_horizontal_left,"
+                    "wrist_right,lower_arm_right_rotation,elbow_right,"
+                    "upper_arm_right_rotation,shoulder_horizontal_right"
                 ),
             )
             self.sts_recovery_pins = [
@@ -228,7 +230,7 @@ class MotorControl(Node):
             )
             self.get_logger().info(
                 f"STS recovery watchdog started for "
-                f"{len(self.sts_recovery_pins)} configured left-side motors on "
+                f"{len(self.sts_recovery_pins)} configured STS motors on "
                 f"{sorted(recovery_ports)}; checking one motor per bus every "
                 f"{recovery_interval:.1f} seconds"
             )

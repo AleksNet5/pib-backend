@@ -61,8 +61,8 @@ services:
       - ROBSTRIDE_PRIME_POSITION_TARGET=true
       - ROBSTRIDE_PRIME_SETTLE_SECONDS=0.05
       - STS_RECOVERY_ENABLED=true
-      - STS_RECOVERY_PORTS=/dev/ttyMotor2,/dev/ttyMotor3
-      - STS_RECOVERY_MOTOR_NAMES=thumb_left_opposition,thumb_left_stretch,index_left_stretch,middle_left_stretch,ring_left_stretch,pinky_left_stretch,wrist_left,lower_arm_left_rotation,elbow_left,upper_arm_left_rotation,shoulder_horizontal_left
+      - STS_RECOVERY_PORTS=/dev/ttyMotor1,/dev/ttyMotor2,/dev/ttyMotor3
+      - STS_RECOVERY_MOTOR_NAMES=thumb_left_opposition,thumb_left_stretch,index_left_stretch,middle_left_stretch,ring_left_stretch,pinky_left_stretch,wrist_left,lower_arm_left_rotation,elbow_left,upper_arm_left_rotation,shoulder_horizontal_left,wrist_right,lower_arm_right_rotation,elbow_right,upper_arm_right_rotation,shoulder_horizontal_right
       - STS_RECOVERY_INTERVAL_SECONDS=2.0
       - STS_RECOVERY_FAILURE_THRESHOLD=2
       - STS_PORT_AUTO_REOPEN_ENABLED=false

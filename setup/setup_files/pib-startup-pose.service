@@ -1,5 +1,5 @@
 [Unit]
-Description=Move pib to its startup and poweroff pose
+Description=Move pib through its startup and poweroff pose sequence
 Wants=network-online.target
 After=network-online.target docker.service
 Requires=docker.service

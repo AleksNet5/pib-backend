@@ -9,7 +9,6 @@ for ((attempt = 1; attempt <= CONTAINER_TIMEOUT; attempt++)); do
         exec docker exec "${CONTAINER}" \
             /ros_entrypoint.sh \
             python3 /app/system_pose.py \
-            --pose-name "startup/poweroff pose" \
             "$@"
     fi
     sleep 1

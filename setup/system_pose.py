@@ -8,7 +8,7 @@ from urllib.error import URLError
 from urllib.request import urlopen
 
 
-DEFAULT_POSE_NAME = "startup/poweroff pose"
+DEFAULT_POSE_NAMES = ("start1", "start2", "start3")
 
 
 def log(message: str) -> None:
@@ -166,9 +166,17 @@ def check_motor_service(service_timeout: float) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Apply pib's startup and poweroff pose.",
+        description="Apply pib's startup and poweroff pose sequence.",
     )
-    parser.add_argument("--pose-name", default=DEFAULT_POSE_NAME)
+    parser.add_argument(
+        "--pose-name",
+        dest="pose_names",
+        action="append",
+        help=(
+            "pose to apply; repeat this option for a sequence "
+            "(default: start1, start2, start3)"
+        ),
+    )
     parser.add_argument(
         "--api-timeout",
         type=float,
@@ -185,7 +193,10 @@ def parse_args() -> argparse.Namespace:
         "--settle-seconds",
         type=float,
         default=12,
-        help="seconds to let motors finish after accepting the pose",
+        help=(
+            "seconds to wait after each pose before continuing "
+            "(default: 12)"
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -199,27 +210,45 @@ def main() -> int:
     args = parse_args()
     base_url = os.getenv("FLASK_API_BASE_URL", "http://flask-app:5000")
     try:
-        positions = resolve_pose(base_url, args.pose_name, args.api_timeout)
-        targets, adjustments = clamp_to_motor_limits(
-            base_url,
-            positions,
-            args.api_timeout,
-        )
-        log(f"resolved {args.pose_name!r} with {len(targets)} motor targets")
-        for adjustment in adjustments:
-            log(f"clamped to configured range: {adjustment}")
+        pose_names = args.pose_names or list(DEFAULT_POSE_NAMES)
+        sequence = []
+        for pose_name in pose_names:
+            positions = resolve_pose(base_url, pose_name, args.api_timeout)
+            targets, adjustments = clamp_to_motor_limits(
+                base_url,
+                positions,
+                args.api_timeout,
+            )
+            sequence.append((pose_name, targets))
+            log(f"resolved {pose_name!r} with {len(targets)} motor targets")
+            for adjustment in adjustments:
+                log(f"clamped to configured range: {adjustment}")
 
         if args.dry_run:
             check_motor_service(args.service_timeout)
-            log("dry run successful; API and motor service are ready")
+            log(
+                "dry run successful; all poses, the API, and motor service "
+                "are ready"
+            )
             log("no motor command was sent")
             return 0
 
-        apply_pose(targets, args.service_timeout)
-        log("pose accepted by motor controller")
-        if args.settle_seconds > 0:
-            log(f"waiting {args.settle_seconds:g} seconds for movement to finish")
-            time.sleep(args.settle_seconds)
+        for index, (pose_name, targets) in enumerate(sequence):
+            apply_pose(targets, args.service_timeout)
+            log(f"pose {pose_name!r} accepted by motor controller")
+            if args.settle_seconds > 0:
+                if index + 1 < len(sequence):
+                    next_pose_name = sequence[index + 1][0]
+                    log(
+                        f"waiting {args.settle_seconds:g} seconds before "
+                        f"pose {next_pose_name!r}"
+                    )
+                else:
+                    log(
+                        f"waiting {args.settle_seconds:g} seconds for the "
+                        "final movement to finish"
+                    )
+                time.sleep(args.settle_seconds)
         log("pose sequence completed")
         return 0
     except Exception as error:
