@@ -62,7 +62,7 @@ services:
       - ROBSTRIDE_PRIME_SETTLE_SECONDS=0.05
       - STS_RECOVERY_ENABLED=true
       - STS_RECOVERY_PORTS=/dev/ttyMotor1,/dev/ttyMotor2,/dev/ttyMotor3
-      - STS_RECOVERY_MOTOR_NAMES=thumb_left_opposition,thumb_left_stretch,index_left_stretch,middle_left_stretch,ring_left_stretch,pinky_left_stretch,wrist_left,lower_arm_left_rotation,elbow_left,upper_arm_left_rotation,shoulder_horizontal_left,wrist_right,lower_arm_right_rotation,elbow_right,upper_arm_right_rotation,shoulder_horizontal_right
+      - STS_RECOVERY_MOTOR_NAMES=thumb_left_opposition,thumb_left_stretch,index_left_stretch,middle_left_stretch,ring_left_stretch,pinky_left_stretch,wrist_left,lower_arm_left_rotation,elbow_left,upper_arm_left_rotation,shoulder_horizontal_left,wrist_right,lower_arm_right_rotation,elbow_right,shoulder_horizontal_right
       - STS_RECOVERY_INTERVAL_SECONDS=2.0
       - STS_RECOVERY_FAILURE_THRESHOLD=2
       - STS_PORT_AUTO_REOPEN_ENABLED=false
@@ -73,6 +73,13 @@ services:
       - STS_RECOVERY_MAX_ATTEMPTS=3
       - STS_RECOVERY_WINDOW_SECONDS=60.0
       - STS_ZERO_TICK_OVERRIDES=/dev/ttyMotor1:19=2048
+      - RIGHT_UPPER_ARM_RECOVERY_ENABLED=true
+      - RIGHT_UPPER_ARM_RECOVERY_INTERVAL_SECONDS=0.1
+      - RIGHT_UPPER_ARM_RECOVERY_TRIGGER_MARGIN_TICKS=100
+      - RIGHT_UPPER_ARM_RECOVERY_STEP_TICKS=60
+      - RIGHT_UPPER_ARM_RECOVERY_SPEED=100
+      - RIGHT_UPPER_ARM_RECOVERY_ACCELERATION=5
+      - RIGHT_UPPER_ARM_RECOVERY_MAXIMUM_TICKS=4600
       - ARM_POSITION_LIMIT_TOLERANCE_CENTIDEGREES=1000
       - COLLISION_GUARD_MODE=enforce
       - COLLISION_TRAJECTORY_STEP_DEGREES=0.25
@@ -87,6 +94,7 @@ services:
       - /dev/:/dev/
       - ./ros_packages/motors/motors/collision_guard.py:/app/ros2_ws/install/motors/lib/python3.10/site-packages/motors/collision_guard.py:ro
       - ./ros_packages/motors/motors/motor_control.py:/app/ros2_ws/install/motors/lib/python3.10/site-packages/motors/motor_control.py:ro
+      - ./ros_packages/motors/motors/right_upper_arm_recovery.py:/app/ros2_ws/install/motors/lib/python3.10/site-packages/motors/right_upper_arm_recovery.py:ro
       - ./ros_packages/motors/pib_motors/pib_motors/bricklet_pin.py:/usr/local/lib/python3.10/dist-packages/pib_motors/bricklet_pin.py:ro
       - ./ros_packages/motors/pib_motors/pib_motors/motor.py:/usr/local/lib/python3.10/dist-packages/pib_motors/motor.py:ro
       - ./ros_packages/motors/config/collision_geometry.json:/app/ros2_ws/motors/config/collision_geometry.json:ro

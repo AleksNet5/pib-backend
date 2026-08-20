@@ -251,6 +251,56 @@ class CollisionGuardTest(unittest.TestCase):
             obstacles["Enclosure front wall"]["center_mm"], [0, -900, 600]
         )
 
+    def test_recovery_exemption_ignores_only_the_rear_wall(self):
+        normal = self.guard.clearances(self.photo_pose, sides=("right",))
+        recovery = self.guard.clearances(
+            self.photo_pose,
+            sides=("right",),
+            ignored_obstacle_names={"Enclosure rear wall"},
+        )
+
+        self.assertTrue(
+            any(
+                obstacle_name == "Enclosure rear wall"
+                for _link_name, obstacle_name in normal
+            )
+        )
+        self.assertFalse(
+            any(
+                obstacle_name == "Enclosure rear wall"
+                for _link_name, obstacle_name in recovery
+            )
+        )
+        self.assertEqual(
+            recovery,
+            {
+                pair: clearance
+                for pair, clearance in normal.items()
+                if pair[1] != "Enclosure rear wall"
+            },
+        )
+
+        rear_blocked = self.guard.evaluate(
+            self.live_pose,
+            {"upper_arm_right_rotation": -9000},
+        )
+        rear_exempt = self.guard.evaluate(
+            self.live_pose,
+            {"upper_arm_right_rotation": -9000},
+            ignored_obstacle_names={"Enclosure rear wall"},
+        )
+        other_volume_blocked = self.guard.evaluate(
+            self.live_pose,
+            {"upper_arm_right_rotation": 3000},
+            ignored_obstacle_names={"Enclosure rear wall"},
+        )
+
+        self.assertFalse(rear_blocked.allowed)
+        self.assertIn("Enclosure rear wall", rear_blocked.reason)
+        self.assertTrue(rear_exempt.allowed, rear_exempt.reason)
+        self.assertFalse(other_volume_blocked.allowed)
+        self.assertIn("Volume 4", other_volume_blocked.reason)
+
     def test_logged_shoulder_path_stops_before_upper_column(self):
         result = self.guard.evaluate(
             self.logged_column_crossing_pose,

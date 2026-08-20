@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from typing import Iterable, Tuple
@@ -13,6 +14,10 @@ from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from motors.collision_guard import ARM_MOTOR_NAMES, CollisionGuard, all_arm_names
+from motors.right_upper_arm_recovery import (
+    RightUpperArmRecovery,
+    unwrapped_tick_to_centidegrees,
+)
 
 
 HAND_MOTOR_NAMES = {
@@ -30,9 +35,11 @@ HAND_MOTOR_NAMES = {
     "pinky_right_stretch",
 }
 
-ZERO_RESET_MOTOR_NAMES = HAND_MOTOR_NAMES | {
-    "upper_arm_right_rotation",
-}
+ZERO_RESET_MOTOR_NAMES = HAND_MOTOR_NAMES
+RIGHT_UPPER_ARM_RECOVERY_MOTOR = "upper_arm_right_rotation"
+RIGHT_UPPER_ARM_RECOVERY_IGNORED_OBSTACLES = frozenset(
+    {"Enclosure rear wall"}
+)
 
 
 def bool_env(name: str, default: str) -> bool:
@@ -177,6 +184,20 @@ class MotorControl(Node):
         self.sts_recovery_pin_groups = {}
         self.sts_recovery_group_indices = {}
         self.sts_recovery_sweeps = {}
+        self.right_upper_arm_recovery = None
+        self.right_upper_arm_recovery_timer = None
+        self.right_upper_arm_recovery_error = ""
+        self.right_upper_arm_recovery_collision_positions = None
+        self.right_upper_arm_recovery_enabled = bool_env(
+            "RIGHT_UPPER_ARM_RECOVERY_ENABLED", "false"
+        )
+        self.right_upper_arm_recovery_endpoint = ("/dev/ttyMotor1", 19)
+        self.right_upper_arm_recovery_publisher = self.create_publisher(
+            String, "right_upper_arm_recovery_state", 10
+        )
+        self.right_upper_arm_recovery_status_timer = self.create_timer(
+            0.25, self._publish_right_upper_arm_recovery_state
+        )
         self.pending_arm_targets = {
             side: {} for side in ARM_MOTOR_NAMES
         }
@@ -195,6 +216,7 @@ class MotorControl(Node):
             0.0,
             float(os.getenv("STS_MULTI_MOTOR_STAGGER_SECONDS", "0")),
         )
+        self._start_right_upper_arm_recovery_monitor()
         if bool_env("STS_RECOVERY_ENABLED", "false"):
             recovery_ports = csv_env(
                 "STS_RECOVERY_PORTS",
@@ -218,6 +240,11 @@ class MotorControl(Node):
                 for bricklet_pin in motor.bricklet_pins
                 if motor.name in recovery_motor_names
                 and bricklet_pin.uid in recovery_ports
+                and (
+                    bricklet_pin.uid,
+                    int(bricklet_pin.pin),
+                )
+                != self.right_upper_arm_recovery_endpoint
                 and callable(
                     getattr(bricklet_pin, "maintain_connection", None)
                 )
@@ -265,7 +292,229 @@ class MotorControl(Node):
         # Log that initialization is complete
         self.get_logger().info("Now Running MOTOR_CONTROL")
 
+    def _start_right_upper_arm_recovery_monitor(self) -> None:
+        if not self.right_upper_arm_recovery_enabled:
+            self.get_logger().warning(
+                "Dedicated right upper-arm recovery monitor is disabled"
+            )
+            self._publish_right_upper_arm_recovery_state()
+            return
+
+        candidates = [
+            bricklet_pin
+            for motor in motors
+            if motor.name == "upper_arm_right_rotation"
+            for bricklet_pin in motor.bricklet_pins
+            if (bricklet_pin.uid, int(bricklet_pin.pin))
+            == self.right_upper_arm_recovery_endpoint
+        ]
+        if len(candidates) != 1:
+            self.right_upper_arm_recovery_error = (
+                "Expected exactly one upper_arm_right_rotation servo at "
+                "/dev/ttyMotor1 ID 19, but found "
+                f"{len(candidates)}. All robot motion is locked."
+            )
+            self.get_logger().error(self.right_upper_arm_recovery_error)
+            self._publish_right_upper_arm_recovery_state()
+            return
+
+        bricklet_pin = candidates[0]
+        try:
+            self.right_upper_arm_recovery = RightUpperArmRecovery(
+                bricklet_pin,
+                self.get_logger(),
+                zero_tick=int(getattr(bricklet_pin, "_zero_tick", 2048)),
+                monitor_gap_seconds=float(
+                    os.getenv(
+                        "RIGHT_UPPER_ARM_RECOVERY_MONITOR_GAP_SECONDS", "0.75"
+                    )
+                ),
+                trigger_margin_ticks=int(
+                    os.getenv(
+                        "RIGHT_UPPER_ARM_RECOVERY_TRIGGER_MARGIN_TICKS", "100"
+                    )
+                ),
+                step_ticks=int(
+                    os.getenv("RIGHT_UPPER_ARM_RECOVERY_STEP_TICKS", "60")
+                ),
+                speed=int(os.getenv("RIGHT_UPPER_ARM_RECOVERY_SPEED", "100")),
+                acceleration=int(
+                    os.getenv("RIGHT_UPPER_ARM_RECOVERY_ACCELERATION", "5")
+                ),
+                maximum_recovery_ticks=int(
+                    os.getenv(
+                        "RIGHT_UPPER_ARM_RECOVERY_MAXIMUM_TICKS", "4600"
+                    )
+                ),
+                collision_validator=(
+                    self._validate_right_upper_arm_recovery_collision
+                ),
+            )
+            # Prime feedback before ROS starts accepting service callbacks.
+            self.right_upper_arm_recovery.tick()
+            interval = max(
+                0.05,
+                float(
+                    os.getenv(
+                        "RIGHT_UPPER_ARM_RECOVERY_INTERVAL_SECONDS", "0.1"
+                    )
+                ),
+            )
+            self.right_upper_arm_recovery_timer = self.create_timer(
+                interval, self._monitor_right_upper_arm
+            )
+            self.get_logger().info(
+                "Dedicated right upper-arm wrap monitor started for "
+                f"/dev/ttyMotor1 ID 19 every {interval:.2f} seconds"
+            )
+        except Exception as error:
+            self.right_upper_arm_recovery_error = (
+                "Could not start right upper-arm recovery monitoring: "
+                f"{error}. All robot motion is locked."
+            )
+            self.get_logger().error(self.right_upper_arm_recovery_error)
+        self._publish_right_upper_arm_recovery_state()
+
+    def _monitor_right_upper_arm(self) -> None:
+        if self.right_upper_arm_recovery is None:
+            return
+        was_active = self.right_upper_arm_recovery.motion_locked
+        try:
+            self.right_upper_arm_recovery.tick()
+        except Exception as error:
+            self.right_upper_arm_recovery.stop_with_fault(
+                f"Unexpected automatic recovery error: {error}"
+            )
+        if was_active and not self.right_upper_arm_recovery.motion_locked:
+            self.right_upper_arm_recovery_collision_positions = None
+        self._publish_right_upper_arm_recovery_state()
+
+    def _validate_right_upper_arm_recovery_collision(
+        self,
+        start_tick: int,
+        target_tick: int,
+    ) -> tuple[bool, str]:
+        if self.collision_guard is None:
+            return False, "collision guard is unavailable"
+
+        if self.right_upper_arm_recovery_collision_positions is None:
+            positions = {}
+            missing = []
+            for motor_name in ARM_MOTOR_NAMES["right"]:
+                if motor_name == RIGHT_UPPER_ARM_RECOVERY_MOTOR:
+                    continue
+                motor = name_to_motors[motor_name][0]
+                position = motor.get_position()
+                if not motor.has_valid_position():
+                    missing.append(motor_name)
+                    continue
+                if motor.invert:
+                    position *= -1
+                positions[motor_name] = float(position)
+            if missing:
+                return (
+                    False,
+                    "missing live right-arm feedback for "
+                    f"{sorted(missing)}",
+                )
+            self.right_upper_arm_recovery_collision_positions = positions
+
+        current_positions = dict(
+            self.right_upper_arm_recovery_collision_positions
+        )
+        zero_tick = (
+            self.right_upper_arm_recovery.zero_tick
+            if self.right_upper_arm_recovery is not None
+            else 2048
+        )
+        current_positions[RIGHT_UPPER_ARM_RECOVERY_MOTOR] = (
+            unwrapped_tick_to_centidegrees(start_tick, zero_tick)
+        )
+        target_position = unwrapped_tick_to_centidegrees(
+            target_tick,
+            zero_tick,
+        )
+        result = self.collision_guard.evaluate(
+            current_positions,
+            {RIGHT_UPPER_ARM_RECOVERY_MOTOR: target_position},
+            ignored_obstacle_names=(
+                RIGHT_UPPER_ARM_RECOVERY_IGNORED_OBSTACLES
+            ),
+        )
+        if not result.allowed:
+            return (
+                False,
+                f"{result.reason}; minimum clearance "
+                f"{result.minimum_clearance_mm:.1f} mm",
+            )
+        return True, ""
+
+    def _right_upper_arm_motion_locked(self) -> bool:
+        if not self.right_upper_arm_recovery_enabled:
+            return False
+        if self.right_upper_arm_recovery_error:
+            return True
+        return bool(
+            self.right_upper_arm_recovery is not None
+            and self.right_upper_arm_recovery.motion_locked
+        )
+
+    def _recovery_blocks_new_command(self) -> bool:
+        if (
+            self.right_upper_arm_recovery_enabled
+            and self.right_upper_arm_recovery is not None
+            and not self._right_upper_arm_motion_locked()
+        ):
+            self._monitor_right_upper_arm()
+        return self._right_upper_arm_motion_locked()
+
+    def _right_upper_arm_recovery_payload(self) -> dict:
+        if self.right_upper_arm_recovery is not None:
+            return self.right_upper_arm_recovery.status.as_dict()
+        if self.right_upper_arm_recovery_error:
+            return {
+                "active": True,
+                "state": "fault",
+                "motor_name": "upper_arm_right_rotation",
+                "message": self.right_upper_arm_recovery_error,
+                "raw_position": None,
+                "unwrapped_position": None,
+                "target_position": 2048,
+                "progress_percent": 0,
+                "direction": "increasing",
+                "error": self.right_upper_arm_recovery_error,
+            }
+        return {
+            "active": False,
+            "state": "disabled",
+            "motor_name": "upper_arm_right_rotation",
+            "message": "Automatic right upper-arm recovery is disabled.",
+            "raw_position": None,
+            "unwrapped_position": None,
+            "target_position": 2048,
+            "progress_percent": 0,
+            "direction": "increasing",
+            "error": "",
+        }
+
+    def _publish_right_upper_arm_recovery_state(self) -> None:
+        message = String()
+        message.data = json.dumps(
+            self._right_upper_arm_recovery_payload(),
+            separators=(",", ":"),
+        )
+        self.right_upper_arm_recovery_publisher.publish(message)
+
+    def _log_recovery_command_rejection(self, command: str) -> None:
+        state = self._right_upper_arm_recovery_payload()
+        self.get_logger().warning(
+            f"Rejected {command} while right upper-arm recovery owns motion: "
+            f"{state['state']}: {state['message']}"
+        )
+
     def _maintain_sts_connections(self) -> None:
+        if self._recovery_blocks_new_command():
+            return
         for uid, pins in self.sts_recovery_pin_groups.items():
             index = self.sts_recovery_group_indices[uid] % len(pins)
             self.sts_recovery_group_indices[uid] = index + 1
@@ -388,13 +637,15 @@ class MotorControl(Node):
     ) -> tuple[list[Tuple[str, float]], bool]:
         available = list(motor_positions)
         blocked = False
-        target_names = {name for name, _position in motor_positions}
+        targets = dict(motor_positions)
+        target_names = set(targets)
 
         for side, arm_names in ARM_MOTOR_NAMES.items():
             if not target_names.intersection(arm_names):
                 continue
 
             outside = {}
+            unsafe = {}
             for motor_name in arm_names:
                 if motor_name not in self.arm_positions:
                     continue
@@ -405,8 +656,31 @@ class MotorControl(Node):
                     self.arm_position_limit_tolerance,
                 ):
                     outside[motor_name] = position
+                    target = targets.get(motor_name)
+                    if (
+                        motor_name == "upper_arm_right_rotation"
+                        or target is None
+                        or not motor.logical_target_moves_toward_range(
+                            position, target
+                        )
+                    ):
+                        unsafe[motor_name] = {
+                            "position": position,
+                            "target": target,
+                        }
 
             if not outside:
+                continue
+
+            if not unsafe:
+                corrective_targets = {
+                    name: targets[name] for name in outside
+                }
+                self.get_logger().warn(
+                    f"Allowing corrective {side} arm target from out-of-range "
+                    f"feedback toward configured limits: current={outside}, "
+                    f"targets={corrective_targets}"
+                )
                 continue
 
             blocked = True
@@ -416,9 +690,8 @@ class MotorControl(Node):
             ]
             self.pending_arm_targets[side].clear()
             self.get_logger().error(
-                f"Blocked {side} arm target because live feedback is outside "
-                f"configured motor limits: {outside}. Use the manual recovery "
-                "tool before sending another arm pose."
+                f"Blocked {side} arm target because it does not safely correct "
+                f"out-of-range feedback: {unsafe}."
             )
 
         return available, blocked
@@ -475,7 +748,10 @@ class MotorControl(Node):
         return clamped_positions
 
     def _retry_pending_arm_targets(self) -> None:
-        if self._retrying_pending_arm_targets:
+        if (
+            self._retrying_pending_arm_targets
+            or self._right_upper_arm_motion_locked()
+        ):
             return
 
         ready = []
@@ -546,6 +822,8 @@ class MotorControl(Node):
             )
 
     def _publish_collision_joint_limits(self, request: String) -> None:
+        if self._recovery_blocks_new_command():
+            return
         try:
             motor_name = request.data
             if (
@@ -595,6 +873,12 @@ class MotorControl(Node):
         self, request: ApplyMotorSettings.Request, response: ApplyMotorSettings.Response
     ) -> ApplyMotorSettings.Response:
 
+        if self._recovery_blocks_new_command():
+            response.settings_applied = False
+            response.settings_persisted = False
+            self._log_recovery_command_rejection("motor-settings command")
+            return response
+
         response.settings_applied = True
         response.settings_persisted = True
 
@@ -631,6 +915,11 @@ class MotorControl(Node):
         response: ResetMotorZero.Response,
     ) -> ResetMotorZero.Response:
         motor_name = request.motor_name
+        if self._recovery_blocks_new_command():
+            response.successful = False
+            response.message = "robot motion is locked during right upper-arm recovery"
+            self._log_recovery_command_rejection("zero-reset command")
+            return response
         if motor_name not in ZERO_RESET_MOTOR_NAMES:
             response.successful = False
             response.message = f"zero reset is not allowed for motor: {motor_name}"
@@ -664,6 +953,10 @@ class MotorControl(Node):
         request: ApplyJointTrajectory.Request,
         response: ApplyJointTrajectory.Response,
     ) -> ApplyJointTrajectory.Response:
+        if self._recovery_blocks_new_command():
+            response.successful = False
+            self._log_recovery_command_rejection("joint-trajectory command")
+            return response
         jt = request.joint_trajectory
         motor_positions = self._clamp_requested_positions(
             list(as_motor_positions(jt))
@@ -760,6 +1053,17 @@ class MotorControl(Node):
                     self.joint_trajectory_publisher.publish(
                         as_joint_trajectory(motor.name, position)
                     )
+                    if (
+                        self.right_upper_arm_recovery is not None
+                        and motor_name in all_arm_names()
+                    ):
+                        self._monitor_right_upper_arm()
+                        if self._right_upper_arm_motion_locked():
+                            response.successful = False
+                            self._log_recovery_command_rejection(
+                                "remaining joint-trajectory commands"
+                            )
+                            return response
         except Exception as e:
             response.successful = False
             self.get_logger().error(f"error while applying joint-trajectory: {str(e)}")

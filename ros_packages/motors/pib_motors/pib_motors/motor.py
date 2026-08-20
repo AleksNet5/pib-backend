@@ -108,6 +108,28 @@ class Motor:
         minimum, maximum = self.logical_position_limits()
         return minimum - tolerance <= position <= maximum + tolerance
 
+    def logical_position_distance_to_range(
+        self,
+        position: int | float,
+    ) -> int | float:
+        """Return zero in range, otherwise the distance to the nearest limit."""
+        minimum, maximum = self.logical_position_limits()
+        if position < minimum:
+            return minimum - position
+        if position > maximum:
+            return position - maximum
+        return 0
+
+    def logical_target_moves_toward_range(
+        self,
+        current_position: int | float,
+        target_position: int | float,
+    ) -> bool:
+        """Return whether a target reduces an existing limit violation."""
+        return self.logical_position_distance_to_range(
+            target_position
+        ) < self.logical_position_distance_to_range(current_position)
+
     def get_position(self) -> int:
         """returns the postion of the motor or '0' if no bricklet-pin is connected"""
         if not self.bricklet_pins:

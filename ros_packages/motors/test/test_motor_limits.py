@@ -58,6 +58,29 @@ class MotorLimitTest(unittest.TestCase):
             motor.logical_position_is_in_range(16260, tolerance=100)
         )
 
+    def test_distance_to_range_identifies_corrective_targets(self):
+        motor = Motor("test", [FakePin()], invert=False)
+        motor.rotation_range_min = -9000
+        motor.rotation_range_max = 9000
+
+        self.assertEqual(motor.logical_position_distance_to_range(-10785), 1785)
+        self.assertEqual(motor.logical_position_distance_to_range(-9000), 0)
+        self.assertEqual(motor.logical_position_distance_to_range(400), 0)
+        self.assertEqual(motor.logical_position_distance_to_range(9500), 500)
+
+        self.assertTrue(
+            motor.logical_target_moves_toward_range(-10785, -9000)
+        )
+        self.assertTrue(
+            motor.logical_target_moves_toward_range(-10785, -10000)
+        )
+        self.assertFalse(
+            motor.logical_target_moves_toward_range(-10785, -10785)
+        )
+        self.assertFalse(
+            motor.logical_target_moves_toward_range(-10785, -11000)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -476,12 +476,19 @@ class CollisionGuard:
         return obstacles
 
     def clearances(
-        self, positions: dict[str, float], sides: Iterable[str] = ("left", "right")
+        self,
+        positions: dict[str, float],
+        sides: Iterable[str] = ("left", "right"),
+        *,
+        ignored_obstacle_names: Iterable[str] = (),
     ) -> dict[tuple[str, str], float]:
+        ignored_obstacle_names = frozenset(ignored_obstacle_names)
         result = {}
         for side in sides:
             for body in arm_boxes(side, positions):
                 for obstacle in self.obstacles:
+                    if obstacle.name in ignored_obstacle_names:
+                        continue
                     if body.name in obstacle.ignored_links:
                         continue
                     if isinstance(obstacle, PlaneObstacle):
@@ -523,8 +530,13 @@ class CollisionGuard:
         return None
 
     def evaluate(
-        self, current_positions: dict[str, float], targets: dict[str, float]
+        self,
+        current_positions: dict[str, float],
+        targets: dict[str, float],
+        *,
+        ignored_obstacle_names: Iterable[str] = (),
     ) -> CollisionResult:
+        ignored_obstacle_names = frozenset(ignored_obstacle_names)
         affected_sides = [
             side
             for side, names in ARM_MOTOR_NAMES.items()
@@ -544,7 +556,11 @@ class CollisionGuard:
         )
         steps = max(1, math.ceil(maximum_delta / self.step_centidegrees))
 
-        initial = self.clearances(current_positions, affected_sides)
+        initial = self.clearances(
+            current_positions,
+            affected_sides,
+            ignored_obstacle_names=ignored_obstacle_names,
+        )
         minimum_clearance = min(initial.values())
         last_safe_positions = dict(current_positions)
         initial_by_side = {
@@ -586,7 +602,11 @@ class CollisionGuard:
                     target = target_positions.get(name, start)
                     sample[name] = start + (target - start) * fraction
 
-            clearances = self.clearances(sample, affected_sides)
+            clearances = self.clearances(
+                sample,
+                affected_sides,
+                ignored_obstacle_names=ignored_obstacle_names,
+            )
             minimum_clearance = min(minimum_clearance, min(clearances.values()))
             for side in affected_sides:
                 side_clearances = {
