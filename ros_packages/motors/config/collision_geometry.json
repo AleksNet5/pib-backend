@@ -44,7 +44,7 @@
             "type": "box",
             "rotation_rpy_deg": [0, 0, 0],
             "safety_margin_mm": 30,
-            "center_mm": [-17, -325, 476],
+            "center_mm": [-17, -269, 476],
             "size_mm": [200, 300, 2000]
         },
         {
@@ -92,7 +92,7 @@
             "type": "box",
             "rotation_rpy_deg": [0, 0, 0],
             "safety_margin_mm": 30,
-            "center_mm": [0, -375, 1225],
+            "center_mm": [0, -375, 1064],
             "size_mm": [1800, 1000, 50]
         }
     ]

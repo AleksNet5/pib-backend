@@ -46,6 +46,7 @@ _STS_RECOVERY_WINDOW_SECONDS = max(
     1.0, float(os.getenv("STS_RECOVERY_WINDOW_SECONDS", "60.0"))
 )
 _STS_SLOW_IDS = {18, 19, 20, 21, 38, 39, 40, 41, 50, 51}
+_STS_DEFAULT_ZERO_TICK = int(os.getenv("STS_DEFAULT_ZERO_TICK", "2000"))
 
 # Cache one serial port + packet handler per device so multiple motors on the same bus reuse it
 _port_cache: Dict[str, Tuple[PortHandler, any]] = {}
@@ -67,6 +68,30 @@ def _is_robstride_pin(pin: int, uid: str) -> bool:
 
 def _bool_env(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _sts_zero_tick(pin: int, uid: str) -> int:
+    """Return the persistent software midpoint configured for one STS servo."""
+    zero_tick = _STS_DEFAULT_ZERO_TICK
+    for entry in _csv_env("STS_ZERO_TICK_OVERRIDES", ""):
+        try:
+            endpoint, tick_text = entry.rsplit("=", 1)
+            device, pin_text = endpoint.rsplit(":", 1)
+            if device == uid and int(pin_text) == int(pin):
+                zero_tick = int(tick_text)
+                break
+        except ValueError:
+            logging.error(
+                "Ignoring invalid STS_ZERO_TICK_OVERRIDES entry: %s",
+                entry,
+            )
+
+    if not 0 <= zero_tick <= 4095:
+        raise ValueError(
+            f"STS zero tick for {uid} ID {pin} is outside 0..4095: "
+            f"{zero_tick}"
+        )
+    return zero_tick
 
 
 def _get_or_open_port(device: str, baud: int) -> Tuple[PortHandler, any]:
@@ -157,7 +182,7 @@ class _STSBrickletPin:
         # Lazily opened/cached
         self._ph: PortHandler | None = None
         self._pk: any | None = None
-        self._zero_tick: int = 2000
+        self._zero_tick: int = _sts_zero_tick(self.pin, self.uid)
         self._last_position: int = 0
         self._has_valid_position: bool = False
         self._last_comm_result: int = COMM_SUCCESS

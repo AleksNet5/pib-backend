@@ -158,6 +158,48 @@ class CollisionGuardTest(unittest.TestCase):
         boundary = self.guard.evaluate(self.zero, result.safe_positions)
         self.assertTrue(boundary.allowed, boundary.reason)
 
+    def test_start1_boundary_is_safe_after_hard_limit_clamp(self):
+        current = {
+            "shoulder_vertical_left": -9875,
+            "upper_arm_right_rotation": -9,
+            "lower_arm_right_rotation": 1834,
+            "wrist_left": 1629,
+            "elbow_right": -1209,
+            "elbow_left": 1474,
+            "shoulder_horizontal_right": 7963,
+            "wrist_right": 7577,
+            "shoulder_horizontal_left": -7128,
+            "shoulder_vertical_right": -9169,
+            "upper_arm_left_rotation": -612,
+            "lower_arm_left_rotation": 4543,
+        }
+        targets = {
+            "shoulder_horizontal_left": 0,
+            "shoulder_vertical_left": -7200,
+            "upper_arm_left_rotation": -9000,
+            "elbow_left": 688,
+            "lower_arm_left_rotation": 529,
+            "wrist_left": 43,
+            "shoulder_horizontal_right": -800,
+            "shoulder_vertical_right": -9000,
+            "upper_arm_right_rotation": 8200,
+            "elbow_right": 18,
+            "lower_arm_right_rotation": -274,
+            "wrist_right": -76,
+        }
+
+        result = self.guard.evaluate(current, targets)
+        self.assertFalse(result.allowed)
+        hard_clamped = {
+            name: max(-9000, min(9000, position))
+            for name, position in result.safe_positions.items()
+        }
+
+        self.assertEqual(hard_clamped["shoulder_vertical_left"], -9000)
+        self.assertEqual(hard_clamped["shoulder_vertical_right"], -9000)
+        validation = self.guard.evaluate(current, hard_clamped)
+        self.assertTrue(validation.allowed, validation.reason)
+
     def test_starting_inside_zone_can_move_out(self):
         result = self.guard.evaluate(
             self.live_pose,

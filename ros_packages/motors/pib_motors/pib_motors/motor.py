@@ -84,10 +84,29 @@ class Motor:
         """sets the position of all bricklet-pins associated with this motor"""
         if not self.bricklet_pins:
             return False
+        position = self.clamp_logical_position(position)
         if self.invert:
             position *= -1
-        position = self._validate_position(position)
         return all(bp.set_position(position) for bp in self.bricklet_pins)
+
+    def logical_position_limits(self) -> tuple[int, int]:
+        """Return configured limits in the coordinate system used by ROS."""
+        if self.invert:
+            return -self.rotation_range_max, -self.rotation_range_min
+        return self.rotation_range_min, self.rotation_range_max
+
+    def clamp_logical_position(self, position: int | float) -> int | float:
+        """Clamp a ROS position while preserving motor inversion semantics."""
+        minimum, maximum = self.logical_position_limits()
+        return min(max(position, minimum), maximum)
+
+    def logical_position_is_in_range(
+        self,
+        position: int | float,
+        tolerance: int | float = 0,
+    ) -> bool:
+        minimum, maximum = self.logical_position_limits()
+        return minimum - tolerance <= position <= maximum + tolerance
 
     def get_position(self) -> int:
         """returns the postion of the motor or '0' if no bricklet-pin is connected"""

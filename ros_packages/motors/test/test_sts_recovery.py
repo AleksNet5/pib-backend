@@ -1,6 +1,7 @@
 import sys
 import unittest
 from collections import deque
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -11,6 +12,7 @@ from pib_motors.bricklet_pin import (  # noqa: E402
     COMM_RX_TIMEOUT,
     COMM_SUCCESS,
     _STSBrickletPin,
+    _sts_zero_tick,
 )
 
 
@@ -120,6 +122,15 @@ def make_pin(packet_handler):
 
 
 class STSRecoveryTest(unittest.TestCase):
+    def test_zero_tick_override_is_scoped_to_device_and_id(self):
+        with patch.dict(
+            os.environ,
+            {"STS_ZERO_TICK_OVERRIDES": "/dev/ttyMotor1:19=2048"},
+        ):
+            self.assertEqual(_sts_zero_tick(19, "/dev/ttyMotor1"), 2048)
+            self.assertEqual(_sts_zero_tick(18, "/dev/ttyMotor1"), 2000)
+            self.assertEqual(_sts_zero_tick(19, "/dev/ttyMotor2"), 2000)
+
     def test_position_command_retries_after_torque_timeout(self):
         packet_handler = FakePacketHandler(
             torque_results=[(COMM_RX_TIMEOUT, 0), (COMM_SUCCESS, 0)]

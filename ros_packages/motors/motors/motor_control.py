@@ -30,6 +30,10 @@ HAND_MOTOR_NAMES = {
     "pinky_right_stretch",
 }
 
+ZERO_RESET_MOTOR_NAMES = HAND_MOTOR_NAMES | {
+    "upper_arm_right_rotation",
+}
+
 
 def bool_env(name: str, default: str) -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
@@ -178,6 +182,15 @@ class MotorControl(Node):
         }
         self._retrying_pending_arm_targets = False
         self.arm_position_feedback_missing = set()
+        self.arm_position_limit_tolerance = max(
+            0.0,
+            float(
+                os.getenv(
+                    "ARM_POSITION_LIMIT_TOLERANCE_CENTIDEGREES",
+                    "1000",
+                )
+            ),
+        )
         self.sts_multi_motor_stagger_seconds = max(
             0.0,
             float(os.getenv("STS_MULTI_MOTOR_STAGGER_SECONDS", "0")),
@@ -369,6 +382,98 @@ class MotorControl(Node):
 
         return available, deferred
 
+    def _remove_targets_with_out_of_range_feedback(
+        self,
+        motor_positions: list[Tuple[str, float]],
+    ) -> tuple[list[Tuple[str, float]], bool]:
+        available = list(motor_positions)
+        blocked = False
+        target_names = {name for name, _position in motor_positions}
+
+        for side, arm_names in ARM_MOTOR_NAMES.items():
+            if not target_names.intersection(arm_names):
+                continue
+
+            outside = {}
+            for motor_name in arm_names:
+                if motor_name not in self.arm_positions:
+                    continue
+                motor = name_to_motors[motor_name][0]
+                position = self.arm_positions[motor_name]
+                if not motor.logical_position_is_in_range(
+                    position,
+                    self.arm_position_limit_tolerance,
+                ):
+                    outside[motor_name] = position
+
+            if not outside:
+                continue
+
+            blocked = True
+            side_names = set(arm_names)
+            available = [
+                pair for pair in available if pair[0] not in side_names
+            ]
+            self.pending_arm_targets[side].clear()
+            self.get_logger().error(
+                f"Blocked {side} arm target because live feedback is outside "
+                f"configured motor limits: {outside}. Use the manual recovery "
+                "tool before sending another arm pose."
+            )
+
+        return available, blocked
+
+    def _clamp_requested_positions(
+        self,
+        motor_positions: list[Tuple[str, float]],
+    ) -> list[Tuple[str, float]]:
+        clamped_positions = []
+        for motor_name, position in motor_positions:
+            associated_motors = name_to_motors.get(motor_name)
+            if not associated_motors:
+                clamped_positions.append((motor_name, position))
+                continue
+            if len(associated_motors) != 1:
+                clamped_positions.append((motor_name, position))
+                continue
+
+            clamped = associated_motors[0].clamp_logical_position(position)
+            if clamped != position:
+                self.get_logger().warn(
+                    f"Clamped requested position of {motor_name} from "
+                    f"{position} to configured limit {clamped} before "
+                    "collision evaluation"
+                )
+            clamped_positions.append((motor_name, clamped))
+        return clamped_positions
+
+    def _clamp_and_validate_collision_boundary(
+        self,
+        motor_positions: list[Tuple[str, float]],
+    ) -> list[Tuple[str, float]] | None:
+        clamped_positions = self._clamp_requested_positions(motor_positions)
+        if clamped_positions == motor_positions:
+            return clamped_positions
+
+        validation = self.collision_guard.evaluate(
+            self.arm_positions,
+            dict(clamped_positions),
+        )
+        if not validation.allowed:
+            self.get_logger().error(
+                "Refused motor-limit-clamped collision boundary because its "
+                f"trajectory is not collision-safe: {validation.reason}; "
+                f"targets={dict(clamped_positions)}"
+            )
+            return None
+
+        self.get_logger().warn(
+            "Collision boundary started outside configured motor limits; "
+            "clamped it to the limits and revalidated the complete trajectory: "
+            f"{dict(clamped_positions)}"
+        )
+        return clamped_positions
+
     def _retry_pending_arm_targets(self) -> None:
         if self._retrying_pending_arm_targets:
             return
@@ -526,9 +631,9 @@ class MotorControl(Node):
         response: ResetMotorZero.Response,
     ) -> ResetMotorZero.Response:
         motor_name = request.motor_name
-        if motor_name not in HAND_MOTOR_NAMES:
+        if motor_name not in ZERO_RESET_MOTOR_NAMES:
             response.successful = False
-            response.message = f"zero reset is only allowed for hand motors: {motor_name}"
+            response.message = f"zero reset is not allowed for motor: {motor_name}"
             self.get_logger().warn(response.message)
             return response
 
@@ -560,7 +665,9 @@ class MotorControl(Node):
         response: ApplyJointTrajectory.Response,
     ) -> ApplyJointTrajectory.Response:
         jt = request.joint_trajectory
-        motor_positions = list(as_motor_positions(jt))
+        motor_positions = self._clamp_requested_positions(
+            list(as_motor_positions(jt))
+        )
         is_multi_motor_request = len(motor_positions) > 1
         last_sts_command_at: dict[str, float] = {}
         response.successful = True
@@ -573,6 +680,13 @@ class MotorControl(Node):
                         self._defer_targets_without_feedback(motor_positions)
                     )
                     if deferred:
+                        response.successful = False
+                    motor_positions, blocked_out_of_range = (
+                        self._remove_targets_with_out_of_range_feedback(
+                            motor_positions
+                        )
+                    )
+                    if blocked_out_of_range:
                         response.successful = False
                     if not motor_positions:
                         return response
@@ -595,6 +709,14 @@ class MotorControl(Node):
                             )
                             for motor_name, position in motor_positions
                         ]
+                        clamped_positions = (
+                            self._clamp_and_validate_collision_boundary(
+                                clamped_positions
+                            )
+                        )
+                        if clamped_positions is None:
+                            response.successful = False
+                            return response
                         can_move_to_boundary = any(
                             motor_name in safe_positions
                             and abs(position - self.arm_positions[motor_name]) >= 1

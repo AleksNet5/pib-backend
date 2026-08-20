@@ -72,6 +72,8 @@ services:
       - STS_RECOVERY_RETRY_SECONDS=2.0
       - STS_RECOVERY_MAX_ATTEMPTS=3
       - STS_RECOVERY_WINDOW_SECONDS=60.0
+      - STS_ZERO_TICK_OVERRIDES=/dev/ttyMotor1:19=2048
+      - ARM_POSITION_LIMIT_TOLERANCE_CENTIDEGREES=1000
       - COLLISION_GUARD_MODE=enforce
       - COLLISION_TRAJECTORY_STEP_DEGREES=0.25
       - COLLISION_RANGE_STEP_DEGREES=1.0
@@ -89,6 +91,9 @@ services:
       - ./ros_packages/motors/pib_motors/pib_motors/motor.py:/usr/local/lib/python3.10/dist-packages/pib_motors/motor.py:ro
       - ./ros_packages/motors/config/collision_geometry.json:/app/ros2_ws/motors/config/collision_geometry.json:ro
       - ./setup/system_pose.py:/app/system_pose.py:ro
+      - ./ros_packages/motors/tools/recover_right_upper_arm.py:/app/recover_right_upper_arm.py:ro
+      - ./ros_packages/motors/tools/untwist_right_upper_arm.py:/app/untwist_right_upper_arm.py:ro
+      - ./ros_packages/motors/tools/calibrate_right_upper_arm_zero.py:/app/calibrate_right_upper_arm_zero.py:ro
       
   ros-programs:
     image: ros_programs
